@@ -1,23 +1,17 @@
 {
   "online": true,
-  "players": [
-    "Joksuu_",
-    "PowerRubik"
-  ],
-  "count": 2,
+  "players": [],
+  "count": 0,
   "fail_streak": 0,
-  "status_msg_id": "1531404893401780225",
-  "sessions": {
-    "Joksuu_": 1785185774.6910121,
-    "PowerRubik": 1785185774.6910121
-  },
+  "status_msg_id": "1531434890560671756",
+  "sessions": {},
   "week": "2026-W31",
   "weekly_seconds": {
     "Joksuu_": 4222.644144773483,
     "PowerRubik": 3600
   },
   "weekly_msg_id": "1531366418648662199",
-  "last_poll": 1785189435.8245406,
+  "last_poll": 1785192929.0740519,
   "alltime_msg_id": "1531386213242638460",
   "milestones": {},
   "alltime_seconds": {
