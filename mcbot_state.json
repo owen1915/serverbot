@@ -1,16 +1,28 @@
 {
   "online": true,
-  "players": [],
-  "count": 0,
+  "players": [
+    "Joksuu_",
+    "PowerRubik"
+  ],
+  "count": 2,
   "fail_streak": 0,
-  "status_msg_id": "1531382376813564006",
-  "sessions": {},
+  "status_msg_id": "1531404893401780225",
+  "sessions": {
+    "Joksuu_": 1785185774.6910121,
+    "PowerRubik": 1785185774.6910121
+  },
   "week": "2026-W31",
   "weekly_seconds": {
-    "Joksuu_": 622.6441447734833
+    "Joksuu_": 2422.6441447734833,
+    "PowerRubik": 1800
   },
   "weekly_msg_id": "1531366418648662199",
-  "last_poll": 1785181962.319726,
+  "last_poll": 1785185774.6910121,
   "alltime_msg_id": "1531386213242638460",
-  "milestones": {}
+  "milestones": {},
+  "alltime_seconds": {
+    "Joksuu_": 1800,
+    "PowerRubik": 1800
+  },
+  "record_players": 2
 }
