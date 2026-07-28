@@ -1,66 +1,103 @@
-# mcbot — Minecraft server → Discord notifier
+# mcbot — Minecraft server → Discord
 
-Polls the [mcsrvstat.us](https://api.mcsrvstat.us) API for `71.176.227.214` and posts to
-Discord webhooks. Python 3 standard library only — no dependencies, no bot token.
+Runs **on the machine hosting the Minecraft server** and reads the server's own data
+instead of a third-party status API. Python 3 standard library only — no dependencies,
+no bot token, no plugin.
+
+## Where the data comes from
+
+| Source | What it gives |
+| --- | --- |
+| `logs/latest.log` | joins, leaves, deaths, advancements, chat, start/stop — **within a second** |
+| status ping on `127.0.0.1:25565` | authoritative online count, version, MOTD, latency |
+| `world/players/stats/*.json` | **real** playtime, deaths, kills, blocks mined, distance, trades … |
+| `world/players/advancements/*.json` | advancement counts |
+| `usercache.json` | UUID → name |
+
+This replaces the old mcsrvstat.us polling, which had a 5-minute cache, capped the
+player list at ~12 names, missed anyone who joined and left inside one window, and could
+only estimate playtime by watching. Hours now come from Minecraft's own `play_time`
+counter, so they include history from before this bot existed.
 
 ## What it posts
 
-**Main channel** (`DISCORD_WEBHOOK_URL`):
-- joins: `➡️ Name joined the server (2 online)`
-- leaves with playtime: `⬅️ Name left the server (1 online) — was on for 2h 15m`
-- player-count changes when names aren't available
-- `@everyone 🔴 Server DOWN` after 2 consecutive failed checks; `🟢 Server UP` on recovery
+**Main channel** (`webhook_main`)
+- a live status card — who is on, this session's time, their all-time hours, server
+  version, uptime and ping. Edited in place on quiet checks, re-posted after events so
+  it stays the newest message.
+- `➡️ Name joined the server (2 online) — 16h 32m all-time`
+- `⬅️ Name left the server (1 online) — was on for 2h 15m`
+- `💀 Name was blown up by Creeper`
+- `🎖️ Name earned the advancement [Diamonds!]`
 - `🎉 New record! N players online at once`
-- `🎖️ Name has now played over 50 hours on the server!` (10/25/50/100/250/500/1000h)
-- a live status card (green/red embed with the player list and time-on), always kept
-  as the newest message: edited in place on quiet checks, re-posted after events
+- `🎖️ Name has now played over 50 hours on the server!`
+- `@everyone 🔴 Server DOWN` after ~90s of failed pings; `🟢 Server UP` on recovery
+- `⚠️ running but unreachable from the internet` if the port stops forwarding
 
-**Weekly channel** (`MC_WEEKLY_WEBHOOK_URL`):
-- `🏆 Weekly Playtime` card — hours per player, refreshed on joins/leaves, resets Monday
-- `🏁 Final Standings` posted permanently every Monday for the finished week
-- `👑 All-Time Hours` card — lifetime totals, never resets
+**Leaderboard channel** (`webhook_weekly`) — three cards, all edited in place
+- 🏆 **Weekly Playtime** — resets Monday, with 🏁 **Final Standings** posted permanently
+- 👑 **All-Time Hours**
+- 📊 **Server Statistics** — blocks mined, mob kills, deaths, distance, advancements,
+  items crafted, villager trades, animals bred, fish caught, plus server-wide totals
 
-**Log channel** (`MC_LOG_WEBHOOK_URL`): every log line, ~1 message per check.
+**Log channel** (`webhook_logs`) — the watcher's own significant log lines.
 
-State (player sessions, weekly/all-time totals, message IDs) lives in `mcbot_state.json`.
-A local copy of every log line goes to `mcbot.log`.
+## Setup
 
-## Running locally
+1. `cp config.example.json config.json` and fill it in. `config.json` holds the webhook
+   URLs and is gitignored — **it must never be committed**.
+2. `python mcbot.py --once --dry-run` to check it reads the server correctly.
+3. `python mcbot.py` to run it.
 
-Webhook URLs come only from environment variables — `mcbot.py` contains no secrets and
-is safe to publish. For local runs, `run_local.sh` exports the real URLs (**never commit
-that file**):
+Any setting can also be given as an environment variable: `MCBOT_RELAY_CHAT=1`,
+`MCBOT_DOWN_MENTION=@here`, and so on.
+
+### Options worth knowing
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `relay_chat` | `false` | mirror in-game chat into the main channel |
+| `announce_deaths` | `true` | post death messages |
+| `announce_advancements` | `true` | post advancement messages |
+| `down_mention` | `@everyone` | who to ping when the server goes down (`""` for nobody) |
+| `down_after_seconds` | `90` | failed-ping time before announcing DOWN |
+| `external_check` | `true` | also ping `public_address` to catch port-forwarding breaking |
+
+## Running as a service (Windows)
+
+Registered as the scheduled task **mcbot**, started at logon under `pythonw.exe` so it
+has no console window, and restarted automatically if it ever exits.
+
+```powershell
+Get-ScheduledTask mcbot | Get-ScheduledTaskInfo   # status
+Stop-ScheduledTask  -TaskName mcbot               # stop
+Start-ScheduledTask -TaskName mcbot               # start
+Get-Content mcbot.log -Tail 30 -Wait              # follow the log
+```
+
+State (sessions, weekly baselines, message IDs) lives in `state.json`; the watcher's log
+is `mcbot.log`, rotated at 5 MB. Both are gitignored. Deleting `state.json` is safe — the
+bot rebuilds who is online by replaying `latest.log` and re-posts its cards.
+
+## Tests
 
 ```
-bash run_local.sh                 # watch forever, every 5 minutes
-bash run_local.sh --once          # single check (what GitHub Actions runs)
-bash run_local.sh --once --dry-run  # print instead of posting
+python test_mcbot.py
 ```
 
-## Free 24/7 hosting: GitHub Actions
+Covers following `latest.log` across appends, partial writes, UTF-8 chat and rotation,
+and the classification of log lines (a creeper kill is a death; a `SulfurCube` dying is
+not). No server or network needed.
 
-`.github/workflows/watch.yml` runs `mcbot.py --once` on a schedule and commits
-`mcbot_state.json` back to the repo. Setup:
+## Notes
 
-1. Create a **public** GitHub repo (public = unlimited free Actions minutes; private
-   repos would exceed the 2,000 free min/month at this cadence).
-2. Repo → Settings → Secrets and variables → Actions → add three secrets:
-   `DISCORD_WEBHOOK_URL`, `MC_WEEKLY_WEBHOOK_URL`, `MC_LOG_WEBHOOK_URL`.
-3. Push `mcbot.py`, `README.md`, `mcbot_state.json`, and `.github/workflows/watch.yml`.
-   **Do not push `run_local.sh`** — it contains the webhook URLs.
-4. Actions tab → mc-watch → Run workflow (manual test), check the log channel.
-5. Stop any locally running watcher — two watchers double-count hours.
-
-Caveats: GitHub's cron is best-effort (runs land ~5–15 min apart), so join/leave
-detection lags accordingly and a DOWN alert (2 missed checks) can take up to ~30 min.
-The workflow sets `TZ=America/New_York` so the Monday reset follows US Eastern time.
-
-## Limitations
-
-- The API caches for 5 minutes; someone joining and leaving inside one window is missed.
-  Instant notifications would need a server-side plugin (e.g. DiscordSRV) instead.
-- The server has query disabled, so player names come from the ping sample (caps at ~12
-  players). `enable-query=true` in `server.properties` + opening the query UDP port
-  makes name lists reliable. Count-based events work regardless.
-- All hour totals are "observed time" at poll granularity (±5 min per session locally,
-  a bit coarser on GitHub Actions).
+- The bot never holds `latest.log` open. On Windows an open handle would stop the server
+  from rotating its own log, so every read opens, seeks and closes.
+- Log lines carry a time but no date. Timestamps are reconstructed by counting midnight
+  crossings — forwards from the date in a rotated log's filename, or backwards from the
+  file's modification time for `latest.log`.
+- Stats files are only written when the server saves a player, so for anyone currently
+  online the bot extends their last saved total with the session time seen in the log.
+- Starting mid-week, the weekly board is seeded by replaying the retained log archive, so
+  it is not blank until the next Monday.
+- `enable-query` and `rcon` are both off and are not needed — nothing here depends on them.

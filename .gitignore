@@ -1,0 +1,10 @@
+# Contains the Discord webhook URLs — never commit.
+config.json
+
+# Runtime files.
+state.json
+state.json.tmp
+mcbot.log
+mcbot.log.1
+__pycache__/
+*.pyc

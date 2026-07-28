@@ -1,574 +1,1129 @@
 #!/usr/bin/env python3
-"""Minecraft server watcher -> Discord webhook.
+"""mcbot — Minecraft server -> Discord, reading the server's own data.
 
-Polls api.mcsrvstat.us and posts to a Discord webhook when:
-  - a player joins
-  - a player leaves
-  - the online player count changes (even when names aren't available)
-  - the server goes down or comes back up
+Runs on the machine that hosts the Minecraft server. Instead of polling a
+third-party status API (5-minute cache, no player names, no real statistics)
+it reads three local sources:
 
-Uses only the Python standard library. Configure via the constants below
-or environment variables of the same name.
+  logs/latest.log             instant join / leave / death / advancement / chat
+  TCP status ping on :25565   authoritative online count, version, MOTD, latency
+  world/players/stats/*.json  real playtime, deaths, kills, blocks mined, ...
+
+Standard library only. Configure with config.json next to this file (see
+config.example.json); every key may also be overridden by an env var.
 
 Usage:
-  python mcbot.py                # run forever, polling every POLL_SECONDS
-  python mcbot.py --once         # single check (for cron / Task Scheduler)
-  python mcbot.py --once --dry-run   # print messages instead of posting
+  python mcbot.py                 run forever (the normal mode)
+  python mcbot.py --once          single pass, no log tailing — for testing
+  python mcbot.py --dry-run       print what would be posted, post nothing
 """
 
+import argparse
 import datetime as dt
+import gzip
 import json
 import os
+import re
+import socket
+import struct
 import sys
 import time
 import urllib.error
 import urllib.request
 
-# ---------------------------------------------------------------- config ---
-SERVER_ADDRESS = os.environ.get("MC_SERVER_ADDRESS", "71.176.227.214")
-# Webhook URLs come ONLY from environment variables so this file is safe to
-# publish. Locally: use run_local.sh. On GitHub Actions: repo secrets.
-WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
-POLL_SECONDS = int(os.environ.get("MC_POLL_SECONDS", "300"))  # API caches 5 min
-# How many consecutive failed/offline checks before we announce "server down".
-# Avoids a false alarm from one flaky poll.
-OFFLINE_THRESHOLD = int(os.environ.get("MC_OFFLINE_THRESHOLD", "2"))
-# Who to ping when the server goes down. "@everyone", "@here", or a personal
-# mention like "<@236868384512345678>" (Discord: Settings > Advanced > enable
-# Developer Mode, then right-click your name > Copy User ID).
-DOWN_MENTION = os.environ.get("MC_DOWN_MENTION", "@everyone")
-# All-time playtime marks that earn a shout-out in the main channel, in hours.
-MILESTONE_HOURS = [10, 25, 50, 100, 250, 500, 1000]
-# Mirror every log line to this webhook/channel (~1 message per check).
-# Leave empty to disable.
-LOG_WEBHOOK_URL = os.environ.get("MC_LOG_WEBHOOK_URL", "")
-# Weekly hours leaderboard, posted to its own webhook/channel. Totals reset
-# every Monday. Leave empty to disable.
-WEEKLY_WEBHOOK_URL = os.environ.get("MC_WEEKLY_WEBHOOK_URL", "")
+HERE = os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE = os.path.join(HERE, "config.json")
+STATE_FILE = os.path.join(HERE, "state.json")
+LOG_FILE = os.path.join(HERE, "mcbot.log")
 
-API_URL = f"https://api.mcsrvstat.us/3/{SERVER_ADDRESS}"
-USER_AGENT = "mcbot-status-watcher/1.0 (owengoodman3@gmail.com)"
-_HERE = os.path.dirname(os.path.abspath(__file__))
-STATE_FILE = os.path.join(_HERE, "mcbot_state.json")
-LOG_FILE = os.path.join(_HERE, "mcbot.log")
-# ---------------------------------------------------------------------------
+USER_AGENT = "mcbot/2.0 (local server watcher)"
+TICKS_PER_SECOND = 20
+
+# All-time playtime marks that earn a shout-out, in hours.
+MILESTONE_HOURS = [10, 25, 50, 100, 250, 500, 1000, 2000]
+
+# ------------------------------------------------------------------ config --
+
+DEFAULTS = {
+    # Where the Minecraft server lives. logs/ and world/ are read from here.
+    "server_dir": "",
+    # Address to ping for live status. Localhost — this runs on the server.
+    "host": "127.0.0.1",
+    "port": 25565,
+    # Public address, used only for display and the reachability check.
+    "public_address": "",
+    "webhook_main": "",     # status card + join/leave/death/advancement events
+    "webhook_weekly": "",   # weekly + all-time + statistics leaderboards
+    "webhook_logs": "",     # mirror of this bot's own log lines
+    # Who to ping when the server goes down: "@everyone", "@here", "<@id>", "".
+    "down_mention": "@everyone",
+    # Seconds of failed pings before announcing the server is down.
+    "down_after_seconds": 90,
+    # Relay in-game chat to the main channel.
+    "relay_chat": False,
+    # Announce deaths and advancements.
+    "announce_deaths": True,
+    "announce_advancements": True,
+    # Check from outside that the server is reachable over the internet
+    # (catches port-forwarding breaking while the server itself is fine).
+    "external_check": True,
+    "external_check_minutes": 15,
+    # Timing.
+    "log_poll_seconds": 1,
+    "ping_seconds": 20,
+    "stats_seconds": 60,
+    "status_refresh_seconds": 90,
+    "leaderboard_refresh_seconds": 600,
+}
 
 
-_log_posting = False  # guards against log() -> webhook -> log() recursion
-
-
-def log(message):
-    """Print a timestamped line, append it to mcbot.log, mirror it to Discord."""
-    global _log_posting
-    line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}"
-    print(line, flush=True)
+def load_config():
+    cfg = dict(DEFAULTS)
     try:
-        with open(LOG_FILE, "a") as f:
+        with open(CONFIG_FILE, encoding="utf-8") as f:
+            cfg.update(json.load(f))
+    except FileNotFoundError:
+        pass
+    except json.JSONDecodeError as e:
+        sys.exit(f"config.json is not valid JSON: {e}")
+    for key in DEFAULTS:
+        env = os.environ.get("MCBOT_" + key.upper())
+        if env is not None:
+            cfg[key] = type(DEFAULTS[key])(env) if not isinstance(DEFAULTS[key], bool) \
+                else env.strip().lower() in ("1", "true", "yes", "on")
+    return cfg
+
+
+CFG = load_config()
+
+LOG_PATH = os.path.join(CFG["server_dir"], "logs", "latest.log")
+STATS_DIR = os.path.join(CFG["server_dir"], "world", "players", "stats")
+ADVANCEMENTS_DIR = os.path.join(CFG["server_dir"], "world", "players", "advancements")
+USERCACHE = os.path.join(CFG["server_dir"], "usercache.json")
+
+DRY_RUN = False
+
+# ------------------------------------------------------------------ output --
+
+_mirroring = False  # guards log() -> webhook -> log() recursion
+
+LOG_MAX_BYTES = 5 * 1024 * 1024
+
+
+def _rotate_log():
+    try:
+        if os.path.getsize(LOG_FILE) > LOG_MAX_BYTES:
+            os.replace(LOG_FILE, LOG_FILE + ".1")
+    except OSError:
+        pass
+
+
+def log(message, mirror=False):
+    """Timestamped line to stdout and mcbot.log; optionally to the log channel."""
+    global _mirroring
+    line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}"
+    # Under pythonw.exe there is no console and sys.stdout is None.
+    if sys.stdout is not None:
+        print(line, flush=True)
+    try:
+        _rotate_log()
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
             f.write(line + "\n")
     except OSError as e:
-        print(f"[warn] could not write log file: {e}", file=sys.stderr)
-    if LOG_WEBHOOK_URL and not _log_posting:
-        _log_posting = True
+        if sys.stderr is not None:
+            print(f"[warn] could not write log file: {e}", file=sys.stderr)
+    if mirror and CFG["webhook_logs"] and not _mirroring and not DRY_RUN:
+        _mirroring = True
         try:
-            _webhook_request(
-                LOG_WEBHOOK_URL,
-                "POST",
-                {
-                    "content": f"`{line}`",
-                    "username": "MC Watch Logs",
-                    "allowed_mentions": {"parse": []},  # log text can never ping anyone
-                },
-            )
+            discord(CFG["webhook_logs"], "POST", {
+                "content": f"`{line}`",
+                "username": "MC Logs",
+                "allowed_mentions": {"parse": []},  # log text must never ping
+            })
         except Exception as e:
-            print(f"[warn] log webhook post failed: {e}", file=sys.stderr)
+            if sys.stderr is not None:
+                print(f"[warn] log webhook failed: {e}", file=sys.stderr)
         finally:
-            _log_posting = False
+            _mirroring = False
 
 
-def fetch_status():
-    """Return the parsed API response, or None if the API itself is unreachable."""
-    req = urllib.request.Request(API_URL, headers={"User-Agent": USER_AGENT})
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.load(resp)
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as e:
-        log(f"[warn] API request failed: {e}")
-        return None
-
-
-def load_state():
-    try:
-        with open(STATE_FILE) as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {"online": None, "players": [], "count": 0, "fail_streak": 0}
-
-
-def save_state(state):
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2)
-
-
-def _webhook_request(url, method="POST", payload=None):
+def discord(url, method="POST", payload=None, retries=3):
+    """One Discord webhook call, honouring 429 rate limits."""
     data = json.dumps(payload).encode() if payload is not None else None
-    req = urllib.request.Request(
-        url,
-        data=data,
-        method=method,
-        headers={"Content-Type": "application/json", "User-Agent": USER_AGENT},
-    )
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        raw = resp.read()
-        return json.loads(raw) if raw else None
+    req = urllib.request.Request(url, data=data, method=method, headers={
+        "Content-Type": "application/json", "User-Agent": USER_AGENT})
+    for attempt in range(retries):
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                raw = resp.read()
+                return json.loads(raw) if raw else None
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and attempt < retries - 1:
+                try:
+                    wait = float(json.loads(e.read()).get("retry_after", 1))
+                except Exception:
+                    wait = 1.0
+                time.sleep(min(wait, 10) + 0.1)
+                continue
+            raise
+    raise RuntimeError("unreachable")
 
 
-def post_discord(content, dry_run=False):
-    if dry_run:
+def say(content):
+    """Post an event message to the main channel."""
+    if DRY_RUN:
         log(f"[dry-run] {content}")
         return
     try:
-        _webhook_request(
-            WEBHOOK_URL,
-            "POST",
-            {
-                "content": content,
-                "username": "MC Server Watch",
-                # Without this, webhook @everyone/user mentions may not actually ping.
-                "allowed_mentions": {"parse": ["everyone", "users", "roles"]},
-            },
-        )
-        log(f"[posted] {content}")
-    except urllib.error.URLError as e:
-        log(f"[error] Discord webhook post failed: {e}")
+        discord(CFG["webhook_main"], "POST", {
+            "content": content,
+            "username": "MC Server",
+            "allowed_mentions": {"parse": ["everyone", "users", "roles"]},
+        })
+        log(f"[posted] {content}", mirror=True)
+    except (urllib.error.URLError, OSError) as e:
+        log(f"[error] could not post to main channel: {e}")
 
+
+def upsert_embed(url, state_key, state, embed, reposition=False):
+    """Keep a single embed message current.
+
+    Edits it in place, or deletes and re-posts it when reposition is set so the
+    card stays the newest message in the channel after event messages.
+    """
+    if DRY_RUN:
+        log(f"[dry-run] embed {state_key}: {embed.get('title')}")
+        return
+    mid = state["msg"].get(state_key)
+    if mid and not reposition:
+        try:
+            discord(f"{url}/messages/{mid}", "PATCH", {"embeds": [embed]})
+            return
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                log(f"[warn] could not edit {state_key}: {e}")
+                return
+            # 404: someone deleted it — fall through and post a new one.
+        except (urllib.error.URLError, OSError) as e:
+            log(f"[warn] could not edit {state_key}: {e}")
+            return
+    if mid and reposition:
+        try:
+            discord(f"{url}/messages/{mid}", "DELETE")
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                log(f"[warn] could not delete old {state_key}: {e}")
+        except (urllib.error.URLError, OSError) as e:
+            log(f"[warn] could not delete old {state_key}: {e}")
+    try:
+        resp = discord(url + "?wait=true", "POST",
+                       {"username": "MC Server", "embeds": [embed]})
+        state["msg"][state_key] = resp["id"]
+        log(f"[card] posted {state_key}")
+    except (urllib.error.URLError, OSError) as e:
+        log(f"[error] could not post {state_key}: {e}")
+
+
+# ------------------------------------------------------------- status ping --
+
+def _varint(n):
+    out = b""
+    while True:
+        b = n & 0x7F
+        n >>= 7
+        out += bytes([b | (0x80 if n else 0)])
+        if not n:
+            return out
+
+
+def _read_varint(sock):
+    n = 0
+    for i in range(5):
+        b = sock.recv(1)
+        if not b:
+            raise ConnectionError("connection closed")
+        n |= (b[0] & 0x7F) << (7 * i)
+        if not b[0] & 0x80:
+            return n
+    raise ValueError("varint too long")
+
+
+def ping_server(host=None, port=None, timeout=5):
+    """Minecraft Server List Ping. Returns the status dict, or None if down."""
+    host = host or CFG["host"]
+    port = port or CFG["port"]
+    sock = None
+    try:
+        started = time.time()
+        sock = socket.create_connection((host, port), timeout=timeout)
+        sock.settimeout(timeout)
+        addr = host.encode()
+        # handshake: protocol version, address, port, next state = 1 (status)
+        hs = (b"\x00" + _varint(776) + _varint(len(addr)) + addr
+              + struct.pack(">H", port) + _varint(1))
+        sock.sendall(_varint(len(hs)) + hs)
+        sock.sendall(_varint(1) + b"\x00")  # status request
+        _read_varint(sock)                  # packet length
+        _read_varint(sock)                  # packet id
+        length = _read_varint(sock)
+        buf = b""
+        while len(buf) < length:
+            chunk = sock.recv(min(8192, length - len(buf)))
+            if not chunk:
+                break
+            buf += chunk
+        data = json.loads(buf.decode("utf-8", "replace"))
+        data["_latency_ms"] = int((time.time() - started) * 1000)
+        return data
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    finally:
+        if sock:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+
+def describe_motd(desc):
+    """Flatten a chat-component or plain-string MOTD into text."""
+    if isinstance(desc, str):
+        return desc
+    if isinstance(desc, dict):
+        text = desc.get("text", "")
+        for extra in desc.get("extra", []):
+            text += describe_motd(extra)
+        return text
+    if isinstance(desc, list):
+        return "".join(describe_motd(d) for d in desc)
+    return ""
+
+
+# ------------------------------------------------------ server stats files --
+
+def load_usercache():
+    """uuid -> name, from the server's own cache."""
+    try:
+        with open(USERCACHE, encoding="utf-8") as f:
+            return {e["uuid"]: e["name"] for e in json.load(f)}
+    except (OSError, json.JSONDecodeError, KeyError, TypeError):
+        return {}
+
+
+def _sum_prefix(custom, suffix):
+    return sum(v for k, v in custom.items() if k.endswith(suffix))
+
+
+def load_stats():
+    """name -> real statistics, read straight out of world/players/stats."""
+    names = load_usercache()
+    out = {}
+    try:
+        files = os.listdir(STATS_DIR)
+    except OSError:
+        return out
+    for fn in files:
+        if not fn.endswith(".json"):
+            continue
+        uuid = fn[:-5]
+        name = names.get(uuid)
+        if not name:
+            continue
+        path = os.path.join(STATS_DIR, fn)
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+        stats = data.get("stats", {})
+        custom = stats.get("minecraft:custom", {})
+        out[name] = {
+            "uuid": uuid,
+            "play_time": custom.get("minecraft:play_time", 0) / TICKS_PER_SECOND,
+            "deaths": custom.get("minecraft:deaths", 0),
+            "mob_kills": custom.get("minecraft:mob_kills",
+                                    sum(stats.get("minecraft:killed", {}).values())),
+            "player_kills": custom.get("minecraft:player_kills", 0),
+            "mined": sum(stats.get("minecraft:mined", {}).values()),
+            "crafted": sum(stats.get("minecraft:crafted", {}).values()),
+            "distance_cm": _sum_prefix(custom, "_one_cm"),
+            "jumps": custom.get("minecraft:jump", 0),
+            "damage_dealt": custom.get("minecraft:damage_dealt", 0) / 10,
+            "damage_taken": custom.get("minecraft:damage_taken", 0) / 10,
+            "fish_caught": custom.get("minecraft:fish_caught", 0),
+            "animals_bred": custom.get("minecraft:animals_bred", 0),
+            "trades": custom.get("minecraft:traded_with_villager", 0),
+            "raid_wins": custom.get("minecraft:raid_win", 0),
+            "advancements": count_advancements(uuid),
+            "mtime": os.path.getmtime(path),
+        }
+    return out
+
+
+def count_advancements(uuid):
+    """Completed advancements, ignoring the recipe-unlock pseudo-advancements."""
+    path = os.path.join(ADVANCEMENTS_DIR, f"{uuid}.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return 0
+    n = 0
+    for key, val in data.items():
+        if key == "DataVersion" or "recipes/" in key:
+            continue
+        if isinstance(val, dict) and val.get("done"):
+            n += 1
+    return n
+
+
+def live_playtime(stats, state, name, now):
+    """All-time seconds for a player, including the session in progress.
+
+    Stats files are only written when the server saves the player, so for
+    anyone online we extend their last saved total by the session time the
+    log has observed since they joined.
+    """
+    saved = stats.get(name, {}).get("play_time", 0)
+    start = state["players"].get(name)
+    if start is None:
+        return saved
+    at_join = state["play_time_at_join"].get(name, saved)
+    return max(saved, at_join + (now - start))
+
+
+def all_playtimes(stats, state, now):
+    names = set(stats) | set(state["players"])
+    return {n: live_playtime(stats, state, n, now) for n in names}
+
+
+# ------------------------------------------------------------- log reading --
+
+LINE_RE = re.compile(r"^\[(\d{2}):(\d{2}):(\d{2})\] \[[^\]]*\]: (.*)$")
+JOIN_RE = re.compile(r"^(\w{1,16}) joined the game$")
+LEAVE_RE = re.compile(r"^(\w{1,16}) left the game$")
+CHAT_RE = re.compile(r"^<(\w{1,16})> (.+)$")
+ADV_RE = re.compile(
+    r"^(\w{1,16}) has (?:made the advancement|completed the challenge|reached the goal) \[(.+)\]$")
+START_RE = re.compile(r'^Done \([^)]*\)! For help, type')
+STOP_RE = re.compile(r"^Stopping the server$")
+# Lines that begin with a player name but are not deaths.
+NOT_DEATH_RE = re.compile(
+    r"^\w{1,16} (?:joined the game|left the game|lost connection|"
+    r"has made the advancement|has completed the challenge|has reached the goal|"
+    r"issued server command|moved too quickly|moved wrongly|"
+    r"was kicked|tried to swim in lava to escape)")
+
+
+def parse_line(raw):
+    """('HH:MM:SS', message) for a well-formed log line, else None."""
+    m = LINE_RE.match(raw.rstrip("\n"))
+    if not m:
+        return None
+    return f"{m.group(1)}:{m.group(2)}:{m.group(3)}", m.group(4)
+
+
+FINGERPRINT_BYTES = 300
+
+
+class LogReader:
+    """Reads new lines from latest.log without holding the file open.
+
+    The server renames latest.log when it rotates, and on Windows an open
+    handle would make that rename fail — so every read opens, seeks and closes.
+    Positions are byte offsets and the file is read in binary, because text-mode
+    offsets are opaque cookies that cannot be added to or compared.
+    """
+
+    def __init__(self, path):
+        self.path = path
+        self.pos = 0
+        self.fingerprint = None
+
+    def _rotated(self, head, size):
+        """True if latest.log is a different file than the one we were reading."""
+        if self.pos > size:
+            return True  # truncated or replaced by a shorter file
+        # Only trust the header comparison once both samples are full length;
+        # a freshly created log is still shorter than the sample window.
+        return (self.fingerprint is not None
+                and len(head) == FINGERPRINT_BYTES == len(self.fingerprint)
+                and head != self.fingerprint)
+
+    def read_new(self):
+        """Return the complete lines appended since the last call."""
+        try:
+            with open(self.path, "rb") as f:
+                head = f.read(FINGERPRINT_BYTES)
+                size = f.seek(0, os.SEEK_END)
+                if self._rotated(head, size):
+                    log("[log] latest.log rotated — following the new file")
+                    self.pos = 0
+                self.fingerprint = head if len(head) == FINGERPRINT_BYTES else None
+                f.seek(self.pos)
+                data = f.read()
+                # Stop at the last newline: a trailing partial line means the
+                # server is still writing it, so leave it for the next read.
+                cut = data.rfind(b"\n")
+                if cut < 0:
+                    return []
+                self.pos += cut + 1
+                return data[:cut + 1].decode("utf-8", "replace").splitlines()
+        except FileNotFoundError:
+            return []
+        except OSError as e:
+            log(f"[warn] could not read latest.log: {e}")
+            return []
+
+    def seek_end(self):
+        try:
+            with open(self.path, "rb") as f:
+                head = f.read(FINGERPRINT_BYTES)
+                self.fingerprint = head if len(head) == FINGERPRINT_BYTES else None
+                self.pos = f.seek(0, os.SEEK_END)
+        except OSError:
+            self.pos = 0
+
+
+def _absolute_times(raw_lines, start_date=None, mtime=None):
+    """Attach absolute timestamps to log lines, which carry only a clock time.
+
+    Every time the clock runs backwards the log has crossed midnight. With a
+    known start date we count forwards from it; otherwise we anchor the last
+    line at the file's modification date and count backwards.
+    """
+    parsed = [p for p in (parse_line(line) for line in raw_lines) if p]
+    if not parsed:
+        return []
+    offsets, day, prev = [], 0, None
+    for hms, _ in parsed:
+        if prev is not None and hms < prev:
+            day += 1
+        offsets.append(day)
+        prev = hms
+    if start_date is None:
+        start_date = dt.date.fromtimestamp(mtime) - dt.timedelta(days=day)
+    out = []
+    for (hms, msg), off in zip(parsed, offsets):
+        h, m, s = (int(x) for x in hms.split(":"))
+        when = dt.datetime.combine(start_date + dt.timedelta(days=off),
+                                   dt.time(h, m, s))
+        out.append((when.timestamp(), msg))
+    return out
+
+
+def read_whole_log(path):
+    """Every line of latest.log, with absolute timestamps."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            raw = f.readlines()
+        return _absolute_times(raw, mtime=os.path.getmtime(path))
+    except OSError:
+        return []
+
+
+ARCHIVE_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})-\d+\.log\.gz$")
+
+
+def read_all_logs():
+    """Every log line the server still has on disk, oldest first.
+
+    Rotated logs are named after the date they *start*, which is a firmer
+    anchor than a modification time, so use it where it is available.
+    """
+    log_dir = os.path.join(CFG["server_dir"], "logs")
+    events = []
+    try:
+        names = os.listdir(log_dir)
+    except OSError:
+        return []
+    for name in sorted(names):
+        m = ARCHIVE_RE.match(name)
+        if not m:
+            continue
+        start = dt.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        try:
+            with gzip.open(os.path.join(log_dir, name), "rt",
+                           encoding="utf-8", errors="replace") as f:
+                events.extend(_absolute_times(f.readlines(), start_date=start))
+        except (OSError, EOFError) as e:
+            log(f"[warn] could not read {name}: {e}")
+    events.extend(read_whole_log(os.path.join(log_dir, "latest.log")))
+    events.sort(key=lambda e: e[0])
+    return events
+
+
+def playtime_since(epoch):
+    """name -> seconds played since epoch, reconstructed from the log archive.
+
+    Used once, to seed the weekly board when the watcher first starts partway
+    through a week; the stats files know lifetime totals but not when the time
+    was earned.
+    """
+    totals, sessions = {}, {}
+
+    def close(name, start, end):
+        totals[name] = totals.get(name, 0) + max(0, end - max(start, epoch))
+
+    for when, msg in read_all_logs():
+        if START_RE.match(msg) or STOP_RE.match(msg):
+            for name, start in sessions.items():
+                close(name, start, when)
+            sessions.clear()
+            continue
+        m = JOIN_RE.match(msg)
+        if m:
+            sessions[m.group(1)] = when
+            continue
+        m = LEAVE_RE.match(msg)
+        if m:
+            start = sessions.pop(m.group(1), None)
+            if start is not None:
+                close(m.group(1), start, when)
+    now = time.time()
+    for name, start in sessions.items():
+        close(name, start, now)
+    return totals
+
+
+def week_start_epoch(now):
+    d = dt.date.fromtimestamp(now)
+    monday = d - dt.timedelta(days=d.isoweekday() - 1)
+    return dt.datetime.combine(monday, dt.time.min).timestamp()
+
+
+# ------------------------------------------------------------- formatting --
 
 def fmt_duration(seconds):
-    m = int(seconds) // 60
-    if m < 1:
-        return "just joined"
+    seconds = int(max(0, seconds))
+    m, s = divmod(seconds, 60)
     h, m = divmod(m, 60)
     d, h = divmod(h, 24)
     if d:
         return f"{d}d {h}h"
     if h:
         return f"{h}h {m}m"
-    return f"{m}m"
+    if m:
+        return f"{m}m"
+    return f"{s}s"
+
+
+def fmt_distance(cm):
+    km = cm / 100_000
+    if km >= 1:
+        return f"{km:,.1f} km"
+    return f"{cm / 100:,.0f} m"
+
+
+def fmt_number(n):
+    return f"{int(n):,}"
+
+
+def now_iso():
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + "Z"
 
 
 def week_key(epoch):
-    """ISO year-week string, weeks starting Monday — e.g. '2026-W31'."""
     y, w, _ = dt.date.fromtimestamp(epoch).isocalendar()
     return f"{y}-W{w:02d}"
 
 
-def week_start_label(epoch):
+def week_label(epoch):
     d = dt.date.fromtimestamp(epoch)
     monday = d - dt.timedelta(days=d.isoweekday() - 1)
     return monday.strftime("Week of %b %d")
 
 
-def build_weekly_embed(state, epoch, final=False):
-    totals = sorted(state.get("weekly_seconds", {}).items(), key=lambda kv: -kv[1])
-    if totals:
-        medals = ["🥇", "🥈", "🥉"]
-        lines = [
-            f"> {medals[i] if i < 3 else f'`{i + 1}.`'}  **{name}** — {fmt_duration(secs)}"
-            for i, (name, secs) in enumerate(totals)
-        ]
-        body = "\n".join(lines)
-    else:
-        body = "> 💤  *No playtime recorded yet*"
-    label = week_start_label(epoch - 7 * 86400 if final else epoch)
-    return {
-        "title": "🏁  Final Standings" if final else "🏆  Weekly Playtime",
-        "description": f"### {label}\n{body}",
-        "color": 0xF1C40F,  # gold
-        "footer": {"text": "resets every Monday  •  updated"},
-        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + "Z",
-    }
+MEDALS = ["🥇", "🥈", "🥉"]
 
 
-def refresh_weekly_message(state, epoch, dry_run=False):
-    """Edit the leaderboard embed in place; post it if it doesn't exist yet."""
-    if dry_run:
-        log(f"[dry-run] weekly leaderboard refresh: {state.get('weekly_seconds')}")
-        return
-    embed = build_weekly_embed(state, epoch)
-    mid = state.get("weekly_msg_id")
-    if mid:
-        try:
-            _webhook_request(f"{WEEKLY_WEBHOOK_URL}/messages/{mid}", "PATCH", {"embeds": [embed]})
-            log("[weekly] updated leaderboard")
-            return
-        except urllib.error.HTTPError as e:
-            if e.code != 404:
-                log(f"[warn] weekly leaderboard edit failed: {e}")
-                return
-            # 404: someone deleted it — fall through and post a new one.
-        except urllib.error.URLError as e:
-            log(f"[warn] weekly leaderboard edit failed: {e}")
-            return
-    try:
-        resp = _webhook_request(
-            WEEKLY_WEBHOOK_URL + "?wait=true",
-            "POST",
-            {"username": "MC Weekly Hours", "embeds": [embed]},
-        )
-        state["weekly_msg_id"] = resp["id"]
-        log("[weekly] posted leaderboard")
-    except urllib.error.URLError as e:
-        log(f"[error] weekly leaderboard post failed: {e}")
+def rank_lines(pairs, fmt, limit=15, empty="*nothing recorded yet*"):
+    pairs = [p for p in pairs if p[1]]
+    if not pairs:
+        return f"> 💤  {empty}"
+    pairs.sort(key=lambda kv: -kv[1])
+    lines = []
+    for i, (name, value) in enumerate(pairs[:limit]):
+        badge = MEDALS[i] if i < 3 else f"`{i + 1}.`"
+        lines.append(f"> {badge}  **{name}** — {fmt(value)}")
+    if len(pairs) > limit:
+        lines.append(f"> *…and {len(pairs) - limit} more*")
+    return "\n".join(lines)
 
 
-def build_alltime_embed(state):
-    totals = sorted(state.get("alltime_seconds", {}).items(), key=lambda kv: -kv[1])
-    shown = totals[:20]
-    if shown:
-        medals = ["🥇", "🥈", "🥉"]
-        lines = [
-            f"> {medals[i] if i < 3 else f'`{i + 1}.`'}  **{name}** — {fmt_duration(secs)}"
-            for i, (name, secs) in enumerate(shown)
-        ]
-        if len(totals) > 20:
-            lines.append(f"> *…and {len(totals) - 20} more*")
-        body = "\n".join(lines)
-    else:
-        body = "> 💤  *No playtime recorded yet*"
-    return {
-        "title": "👑  All-Time Hours",
-        "description": body,
-        "color": 0x9B59B6,  # purple
-        "footer": {"text": "lifetime totals  •  updated"},
-        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + "Z",
-    }
+def top_field(name, stats, key, fmt, limit=5):
+    pairs = [(n, s.get(key, 0)) for n, s in stats.items() if s.get(key, 0)]
+    if not pairs:
+        return None
+    pairs.sort(key=lambda kv: -kv[1])
+    body = "\n".join(f"{MEDALS[i] if i < 3 else '　'} {n} — {fmt(v)}"
+                     for i, (n, v) in enumerate(pairs[:limit]))
+    return {"name": name, "value": body, "inline": True}
 
 
-def refresh_alltime_message(state, dry_run=False, reposition=False):
-    """Edit the all-time card in place; repost it (delete + post) on rollover."""
-    if dry_run:
-        log(f"[dry-run] all-time leaderboard refresh: {state.get('alltime_seconds')}")
-        return
-    embed = build_alltime_embed(state)
-    mid = state.get("alltime_msg_id")
-    if mid and not reposition:
-        try:
-            _webhook_request(f"{WEEKLY_WEBHOOK_URL}/messages/{mid}", "PATCH", {"embeds": [embed]})
-            log("[weekly] updated all-time leaderboard")
-            return
-        except urllib.error.HTTPError as e:
-            if e.code != 404:
-                log(f"[warn] all-time leaderboard edit failed: {e}")
-                return
-        except urllib.error.URLError as e:
-            log(f"[warn] all-time leaderboard edit failed: {e}")
-            return
-    if mid and reposition:
-        try:
-            _webhook_request(f"{WEEKLY_WEBHOOK_URL}/messages/{mid}", "DELETE")
-        except urllib.error.HTTPError as e:
-            if e.code != 404:
-                log(f"[warn] could not delete old all-time card: {e}")
-        except urllib.error.URLError as e:
-            log(f"[warn] could not delete old all-time card: {e}")
-    try:
-        resp = _webhook_request(
-            WEEKLY_WEBHOOK_URL + "?wait=true",
-            "POST",
-            {"username": "MC Weekly Hours", "embeds": [embed]},
-        )
-        state["alltime_msg_id"] = resp["id"]
-        log("[weekly] posted all-time leaderboard")
-    except urllib.error.URLError as e:
-        log(f"[error] all-time leaderboard post failed: {e}")
+# ----------------------------------------------------------------- embeds --
 
-
-def update_weekly(state, names, epoch, dry_run=False, refresh_now=False):
-    """Accrue online time into this week's totals; roll over each Monday.
-
-    Totals accumulate silently every check; the leaderboard card is only
-    refreshed when refresh_now is set (someone joined/left), on the Monday
-    rollover, or if the card doesn't exist yet.
-    """
-    if not WEEKLY_WEBHOOK_URL:
-        return
-    wk = week_key(epoch)
-    rollover = False
-
-    if state.get("week") != wk:
-        rollover = True
-        # New week: post last week's final standings as a permanent message,
-        # then start a fresh leaderboard.
-        if state.get("week") and state.get("weekly_seconds"):
-            final = build_weekly_embed(state, epoch, final=True)
-            if dry_run:
-                log("[dry-run] weekly final standings post")
-            else:
-                try:
-                    _webhook_request(
-                        WEEKLY_WEBHOOK_URL, "POST",
-                        {"username": "MC Weekly Hours", "embeds": [final]},
-                    )
-                    log(f"[weekly] posted final standings for {state['week']}")
-                except urllib.error.URLError as e:
-                    log(f"[error] weekly final standings post failed: {e}")
-        state["week"] = wk
-        state["weekly_seconds"] = {}
-        state["weekly_msg_id"] = None
-        refresh_now = True
-
-    last = state.get("last_poll")
-    if last and names:
-        # Credit elapsed time since the previous check, capped so a long gap
-        # (watcher was off) doesn't over-credit anyone.
-        credit = min(epoch - last, POLL_SECONDS * 2)
-        if credit > 0:
-            totals = state.setdefault("weekly_seconds", {})
-            alltime = state.setdefault("alltime_seconds", {})
-            for n in names:
-                totals[n] = totals.get(n, 0) + credit
-                alltime[n] = alltime.get(n, 0) + credit
-    state["last_poll"] = epoch
-
-    if refresh_now or not state.get("weekly_msg_id"):
-        refresh_weekly_message(state, epoch, dry_run)
-    # Repost (not edit) the all-time card on rollover so the channel order stays:
-    # final standings -> new weekly card -> all-time card.
-    if rollover or refresh_now or not state.get("alltime_msg_id"):
-        refresh_alltime_message(state, dry_run, reposition=rollover)
-
-
-def build_status_embed(is_online, count, max_players, names, sessions=None):
-    """A colored embed showing who's online right now and for how long."""
-    now = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + "Z"
-    if not is_online:
+def status_embed(state, status, stats, now):
+    """The live card: who is on right now, and for how long."""
+    address = CFG["public_address"] or f"{CFG['host']}:{CFG['port']}"
+    if not status:
         return {
             "title": "🔴  Server Offline",
-            "description": f"`{SERVER_ADDRESS}` is not responding.",
-            "color": 0xED4245,  # Discord red
-            "footer": {"text": "Last checked"},
-            "timestamp": now,
+            "description": f"`{address}` is not responding.",
+            "color": 0xED4245,
+            "footer": {"text": "last checked"},
+            "timestamp": now_iso(),
         }
-    if names:
-        epoch = time.time()
-        sessions = sessions or {}
-        players = "\n".join(
-            f"> 🎮  **{n}**  ·  {fmt_duration(epoch - sessions.get(n, epoch))}"
-            for n in names
-        )
-    elif count > 0:
-        players = f"> 🎮  {count} online *(names hidden by server)*"
+    players = status.get("players", {})
+    count = len(state["players"]) or players.get("online", 0)
+    maximum = players.get("max", "?")
+    if state["players"]:
+        rows = sorted(state["players"].items(), key=lambda kv: kv[1])
+        body = "\n".join(
+            f"> 🎮  **{n}**  ·  on for {fmt_duration(now - start)}"
+            f"  ·  {fmt_duration(live_playtime(stats, state, n, now))} all-time"
+            for n, start in rows)
+    elif players.get("online", 0):
+        body = f"> 🎮  {players['online']} online"
     else:
-        players = "> 💤  *No players online*"
+        body = "> 💤  *No players online*"
+
+    details = []
+    version = status.get("version", {}).get("name")
+    if version:
+        details.append(f"Minecraft {version}")
+    if state.get("server_start"):
+        details.append(f"up {fmt_duration(now - state['server_start'])}")
+    if status.get("_latency_ms") is not None:
+        details.append(f"{status['_latency_ms']} ms")
+    if CFG["external_check"] and state.get("external_ok") is False:
+        details.append("⚠️ unreachable from the internet")
+
+    motd = describe_motd(status.get("description", "")).strip()
+    header = f"### Players Online — {count}/{maximum}"
     return {
         "title": "🟢  Server Online",
-        "description": f"### Players Online — {count}/{max_players}\n{players}",
-        "color": 0x57F287,  # Discord green
-        "footer": {"text": f"{SERVER_ADDRESS}  •  last checked"},
-        "timestamp": now,
+        "description": f"{header}\n{body}",
+        "color": 0x57F287,
+        "footer": {"text": f"{address}  •  " + "  •  ".join(details) + "  •  last checked"
+                   if details else f"{address}  •  last checked"},
+        "timestamp": now_iso(),
+        **({"author": {"name": motd}} if motd else {}),
     }
 
 
-def refresh_status_message(state, is_online, count, max_players, names, dry_run=False, reposition=True, sessions=None):
-    """Keep the status embed current.
+def weekly_embed(state, playtimes, now, final=False):
+    base = state["week_baseline"]
+    pairs = [(n, max(0, t - base.get(n, t))) for n, t in playtimes.items()]
+    label = week_label(now - 7 * 86400 if final else now)
+    return {
+        "title": "🏁  Final Standings" if final else "🏆  Weekly Playtime",
+        "description": f"### {label}\n" + rank_lines(pairs, fmt_duration,
+                                                     empty="*no playtime this week yet*"),
+        "color": 0xF1C40F,
+        "footer": {"text": "resets Monday  •  from the server's own play_time"},
+        "timestamp": now_iso(),
+    }
 
-    reposition=True: delete the old embed and post a fresh one (used after event
-    messages, so the embed stays the newest message in the channel).
-    reposition=False: edit the existing embed in place — updates the player list
-    and "last checked" timestamp on quiet checks without re-sending anything.
-    """
-    if dry_run:
-        log(f"[dry-run] status embed: online={is_online} players={count} {names}")
-        return
-    embed = build_status_embed(is_online, count, max_players, names, sessions)
-    old_id = state.get("status_msg_id")
 
-    if old_id and not reposition:
-        try:
-            _webhook_request(f"{WEBHOOK_URL}/messages/{old_id}", "PATCH", {"embeds": [embed]})
-            log("[status] updated status embed in place")
-            return
-        except urllib.error.HTTPError as e:
-            if e.code != 404:
-                log(f"[warn] could not edit status message: {e}")
-                return
-            # 404: someone deleted it — fall through and post a new one.
-        except urllib.error.URLError as e:
-            log(f"[warn] could not edit status message: {e}")
-            return
+def alltime_embed(playtimes):
+    return {
+        "title": "👑  All-Time Hours",
+        "description": rank_lines(list(playtimes.items()), fmt_duration, limit=20),
+        "color": 0x9B59B6,
+        "footer": {"text": "lifetime totals, straight from the world save"},
+        "timestamp": now_iso(),
+    }
 
-    if old_id and reposition:
-        try:
-            _webhook_request(f"{WEBHOOK_URL}/messages/{old_id}", "DELETE")
-        except urllib.error.HTTPError as e:
-            if e.code != 404:  # already gone is fine
-                log(f"[warn] could not delete old status message: {e}")
-        except urllib.error.URLError as e:
-            log(f"[warn] could not delete old status message: {e}")
 
+def stats_embed(stats):
+    """Real per-player statistics pulled out of the world save."""
+    fields = [
+        top_field("⛏️  Blocks Mined", stats, "mined", fmt_number),
+        top_field("⚔️  Mob Kills", stats, "mob_kills", fmt_number),
+        top_field("☠️  Deaths", stats, "deaths", fmt_number),
+        top_field("🥾  Distance", stats, "distance_cm", fmt_distance),
+        top_field("🏅  Advancements", stats, "advancements", fmt_number),
+        top_field("🔨  Items Crafted", stats, "crafted", fmt_number),
+        top_field("💰  Villager Trades", stats, "trades", fmt_number),
+        top_field("🐄  Animals Bred", stats, "animals_bred", fmt_number),
+        top_field("🎣  Fish Caught", stats, "fish_caught", fmt_number),
+    ]
+    fields = [f for f in fields if f]
+    totals = {
+        "blocks mined": sum(s["mined"] for s in stats.values()),
+        "mobs killed": sum(s["mob_kills"] for s in stats.values()),
+        "deaths": sum(s["deaths"] for s in stats.values()),
+        "advancements": sum(s["advancements"] for s in stats.values()),
+    }
+    summary = "  ·  ".join(f"**{fmt_number(v)}** {k}" for k, v in totals.items())
+    distance = sum(s["distance_cm"] for s in stats.values())
+    summary += f"  ·  **{fmt_distance(distance)}** travelled"
+    return {
+        "title": "📊  Server Statistics",
+        "description": f"### Server totals\n> {summary}",
+        "color": 0x3498DB,
+        "fields": fields,
+        "footer": {"text": f"{len(stats)} players tracked  •  from world/players/stats"},
+        "timestamp": now_iso(),
+    }
+
+
+# ------------------------------------------------------------------ state --
+
+def new_state():
+    return {
+        "schema": 2,
+        "online": None,
+        "players": {},             # name -> session start epoch
+        "play_time_at_join": {},   # name -> all-time seconds when they joined
+        "week": None,
+        "week_baseline": {},       # name -> all-time seconds at week start
+        "msg": {},                 # card name -> Discord message id
+        "record_players": 0,
+        "milestones": {},
+        "milestones_initialised": False,
+        "server_start": None,
+        "external_ok": None,
+        "down_since": None,
+    }
+
+
+def load_state():
     try:
-        resp = _webhook_request(
-            WEBHOOK_URL + "?wait=true",
-            "POST",
-            {"username": "MC Server Watch", "embeds": [embed]},
-        )
-        state["status_msg_id"] = resp["id"]
-        log(f"[status] reposted status embed ({count} online)" if is_online else "[status] reposted status embed (offline)")
-    except urllib.error.URLError as e:
-        log(f"[error] could not post status embed: {e}")
+        with open(STATE_FILE, encoding="utf-8") as f:
+            state = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return new_state()
+    base = new_state()
+    base.update(state)
+    return base
 
 
-def check_once(dry_run=False):
-    state = load_state()
-    data = fetch_status()
+def save_state(state):
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2)
+    os.replace(tmp, STATE_FILE)
 
-    is_online = bool(data and data.get("online"))
 
-    if is_online:
-        p = data.get("players", {})
-        names = sorted(x["name"] for x in p.get("list", []))
-        log(
-            f"[check] online, {p.get('online', 0)}/{p.get('max', '?')} players"
-            + (f" ({', '.join(names)})" if names else "")
-        )
-    else:
-        log(f"[check] offline/unreachable (streak {state.get('fail_streak', 0) + 1})")
+# ------------------------------------------------------------ event engine --
 
-    if not is_online:
-        state["fail_streak"] = state.get("fail_streak", 0) + 1
-        # Announce down only once, after enough consecutive failures,
-        # and only if we previously knew it was up.
-        if state["fail_streak"] == OFFLINE_THRESHOLD and state.get("online") is not False:
-            post_discord(
-                f"{DOWN_MENTION} :red_circle: **Server DOWN** — `{SERVER_ADDRESS}` is not responding.",
-                dry_run,
-            )
+class Bot:
+    def __init__(self):
+        self.state = load_state()
+        self.reader = LogReader(LOG_PATH)
+        self.stats = {}
+        self.dirty = False          # an event happened: refresh cards, reposition
+        self.last_ping = 0.0
+        self.last_stats = 0.0
+        self.last_status_refresh = 0.0
+        self.last_leaderboards = 0.0
+        self.last_external = 0.0
+        self.status = None
+
+    # -- log events -------------------------------------------------------
+
+    def replay(self):
+        """Rebuild the online set and session starts from latest.log, silently."""
+        state = self.state
+        state["players"] = {}
+        state["server_start"] = None
+        for when, msg in read_whole_log(LOG_PATH):
+            if START_RE.match(msg):
+                state["server_start"] = when
+                state["players"] = {}
+                continue
+            if STOP_RE.match(msg):
+                state["players"] = {}
+                continue
+            m = JOIN_RE.match(msg)
+            if m:
+                state["players"][m.group(1)] = when
+                continue
+            m = LEAVE_RE.match(msg)
+            if m:
+                state["players"].pop(m.group(1), None)
+        self.stats = load_stats()
+        for name in state["players"]:
+            state["play_time_at_join"][name] = max(
+                0, self.stats.get(name, {}).get("play_time", 0)
+                - (time.time() - state["players"][name]))
+        log(f"[replay] {len(state['players'])} online: "
+            f"{', '.join(sorted(state['players'])) or '(nobody)'}")
+
+    def handle(self, msg, now):
+        state = self.state
+
+        m = JOIN_RE.match(msg)
+        if m:
+            name = m.group(1)
+            state["players"][name] = now
+            state["play_time_at_join"][name] = self.stats.get(name, {}).get("play_time", 0)
+            count = len(state["players"])
+            total = live_playtime(self.stats, state, name, now)
+            extra = f" — {fmt_duration(total)} all-time" if total >= 60 else " — first time here! 👋"
+            say(f":arrow_right: **{name}** joined the server ({count} online){extra}")
+            self.dirty = True
+            self.check_record(count)
+            return
+
+        m = LEAVE_RE.match(msg)
+        if m:
+            name = m.group(1)
+            start = state["players"].pop(name, None)
+            state["play_time_at_join"].pop(name, None)
+            count = len(state["players"])
+            played = fmt_duration(now - start) if start else "an unknown time"
+            say(f":arrow_left: **{name}** left the server ({count} online) "
+                f"— was on for **{played}**")
+            self.dirty = True
+            return
+
+        if START_RE.match(msg):
+            state["server_start"] = now
+            state["players"] = {}
+            if state["online"] is False:
+                say(f":green_circle: **Server UP** — `{CFG['public_address'] or CFG['host']}` "
+                    f"is back online.")
+            state["online"] = True
+            state["down_since"] = None
+            self.dirty = True
+            return
+
+        if STOP_RE.match(msg):
+            log("[event] server is stopping", mirror=True)
+            state["players"] = {}
+            self.dirty = True
+            return
+
+        m = ADV_RE.match(msg)
+        if m and CFG["announce_advancements"]:
+            name, adv = m.group(1), m.group(2)
+            if name in state["players"]:
+                say(f":medal: **{name}** earned the advancement **[{adv}]**")
+                self.dirty = True
+            return
+
+        m = CHAT_RE.match(msg)
+        if m:
+            if CFG["relay_chat"]:
+                say(f"💬  **{m.group(1)}**: {m.group(2)[:1500]}")
+            return
+
+        # Anything else that starts with the name of somebody currently online
+        # and is not a known non-death line is a death message.
+        if CFG["announce_deaths"]:
+            first = msg.split(" ", 1)[0]
+            if (first in self.state["players"] and not NOT_DEATH_RE.match(msg)
+                    and len(msg) > len(first) + 1):
+                say(f":skull: {msg}")
+                self.dirty = True
+
+    def check_record(self, count):
+        state = self.state
+        if count > state["record_players"]:
+            if count >= 2:
+                previous = (f" (previous best: {state['record_players']})"
+                            if state["record_players"] >= 2 else "")
+                say(f":tada: **New record!** {count} players online at once{previous}")
+            state["record_players"] = count
+
+    # -- periodic work ----------------------------------------------------
+
+    def do_ping(self, now):
+        self.status = ping_server()
+        state = self.state
+        if self.status:
+            if state["online"] is False:
+                say(f":green_circle: **Server UP** — "
+                    f"`{CFG['public_address'] or CFG['host']}` is responding again.")
+                self.dirty = True
+            state["online"] = True
+            state["down_since"] = None
+            return
+        # Ping failed.
+        if state["down_since"] is None:
+            state["down_since"] = now
+        elif (state["online"] is not False
+              and now - state["down_since"] >= CFG["down_after_seconds"]):
+            mention = (CFG["down_mention"] + " ") if CFG["down_mention"] else ""
+            say(f"{mention}:red_circle: **Server DOWN** — "
+                f"`{CFG['public_address'] or CFG['host']}` is not responding.")
             state["online"] = False
-            state["players"] = []
-            state["count"] = 0
-            state["sessions"] = {}
-            refresh_status_message(state, False, 0, "?", [], dry_run, reposition=True)
-        elif state.get("online") is False:
-            # Already announced down — just keep the offline card's timestamp fresh.
-            refresh_status_message(state, False, 0, "?", [], dry_run, reposition=False)
-        update_weekly(state, [], time.time(), dry_run)
-        save_state(state)
-        return
+            state["players"] = {}
+            self.dirty = True
 
-    # --- server is online ---
-    came_back = state.get("online") is False
-    first_run = state.get("online") is None
-    state["fail_streak"] = 0
+    def do_external_check(self):
+        """Confirm the server is reachable from outside, not just on localhost."""
+        address = CFG["public_address"]
+        if not address:
+            return
+        host, _, port = address.partition(":")
+        reachable = ping_server(host, int(port) if port else 25565, timeout=8) is not None
+        was = self.state["external_ok"]
+        self.state["external_ok"] = reachable
+        if was is True and not reachable:
+            say(":warning: The server is running but **cannot be reached from the "
+                f"internet** at `{address}` — check port forwarding.")
+            self.dirty = True
+        elif was is False and reachable:
+            say(f":white_check_mark: `{address}` is reachable from the internet again.")
+            self.dirty = True
 
-    players_info = data.get("players", {})
-    count = players_info.get("online", 0)
-    names = sorted(p["name"] for p in players_info.get("list", []))
+    def roll_week(self, playtimes, now):
+        """Post final standings and reset the weekly baseline every Monday."""
+        state = self.state
+        key = week_key(now)
+        if state["week"] == key:
+            return False
+        first_run = state["week"] is None
+        if state["week"] and state["week_baseline"] and CFG["webhook_weekly"]:
+            final = weekly_embed(state, playtimes, now, final=True)
+            if DRY_RUN:
+                log("[dry-run] final standings")
+            else:
+                try:
+                    discord(CFG["webhook_weekly"], "POST",
+                            {"username": "MC Server", "embeds": [final]})
+                    log(f"[weekly] posted final standings for {state['week']}", mirror=True)
+                except (urllib.error.URLError, OSError) as e:
+                    log(f"[error] final standings post failed: {e}")
+        if first_run:
+            # Starting partway through a week: recover what has already been
+            # played since Monday from the log archive, so the board is not
+            # blank until the next reset.
+            played = playtime_since(week_start_epoch(now))
+            state["week_baseline"] = {n: max(0, t - played.get(n, 0))
+                                      for n, t in playtimes.items()}
+            log(f"[weekly] seeded this week from the logs: "
+                f"{ {n: fmt_duration(s) for n, s in played.items()} }")
+        else:
+            state["week_baseline"] = dict(playtimes)
+        state["week"] = key
+        state["msg"].pop("weekly", None)
+        return True
 
-    old_names = state.get("players", [])
-    old_count = state.get("count", 0)
-    sessions = state.get("sessions", {})
-    epoch = time.time()
+    def check_milestones(self, playtimes):
+        state = self.state
+        if not state["milestones_initialised"]:
+            # First run against real stats: record where everybody already is
+            # instead of announcing years of history all at once.
+            for name, secs in playtimes.items():
+                crossed = [h for h in MILESTONE_HOURS if secs / 3600 >= h]
+                if crossed:
+                    state["milestones"][name] = max(crossed)
+            state["milestones_initialised"] = True
+            return
+        for name, secs in playtimes.items():
+            hours = secs / 3600
+            crossed = [h for h in MILESTONE_HOURS
+                       if hours >= h > state["milestones"].get(name, 0)]
+            if crossed:
+                top = max(crossed)
+                say(f":military_medal: **{name}** has now played over "
+                    f"**{top} hours** on the server!")
+                state["milestones"][name] = top
+                self.dirty = True
 
-    messages = []
+    def refresh_cards(self, now, reposition):
+        state = self.state
+        playtimes = all_playtimes(self.stats, state, now)
 
-    if came_back:
-        messages.append(
-            f":green_circle: **Server UP** — `{SERVER_ADDRESS}` is back online "
-            f"({count} player{'s' if count != 1 else ''} on)."
-        )
+        if CFG["webhook_main"]:
+            upsert_embed(CFG["webhook_main"], "status", state,
+                         status_embed(state, self.status, self.stats, now),
+                         reposition=reposition)
+        if not CFG["webhook_weekly"]:
+            return
+        rolled = self.roll_week(playtimes, now)
+        for name in playtimes:
+            state["week_baseline"].setdefault(name, playtimes[name])
+        url = CFG["webhook_weekly"]
+        upsert_embed(url, "weekly", state, weekly_embed(state, playtimes, now),
+                     reposition=rolled)
+        upsert_embed(url, "alltime", state, alltime_embed(playtimes),
+                     reposition=rolled)
+        upsert_embed(url, "stats", state, stats_embed(self.stats),
+                     reposition=rolled)
 
-    if not first_run and not came_back:
-        joined = [n for n in names if n not in old_names]
-        left = [n for n in old_names if n not in names]
-        for n in joined:
-            messages.append(f":arrow_right: **{n}** joined the server ({count} online)")
-        for n in left:
-            played = epoch - sessions.pop(n, epoch)
-            was_on = fmt_duration(played) if played >= 60 else "under a minute"
-            messages.append(
-                f":arrow_left: **{n}** left the server ({count} online) — was on for **{was_on}**"
-            )
+    # -- main loop --------------------------------------------------------
 
-        # Count changed but the names don't explain it (list missing or partial).
-        explained = old_count + len(joined) - len(left)
-        if count != old_count and count != explained:
-            messages.append(
-                f":busts_in_silhouette: Players online changed: "
-                f"**{old_count} → {count}** (of {players_info.get('max', '?')})"
-            )
+    def tick(self, now):
+        if now - self.last_ping >= CFG["ping_seconds"]:
+            self.last_ping = now
+            self.do_ping(now)
+        if now - self.last_stats >= CFG["stats_seconds"]:
+            self.last_stats = now
+            self.stats = load_stats()
+            self.check_milestones(all_playtimes(self.stats, self.state, now))
+        if (CFG["external_check"] and CFG["public_address"]
+                and now - self.last_external >= CFG["external_check_minutes"] * 60):
+            self.last_external = now
+            self.do_external_check()
 
-    if first_run:
-        messages.append(
-            f":white_check_mark: Watcher started — `{SERVER_ADDRESS}` is online "
-            f"with {count} player{'s' if count != 1 else ''}."
-            + (f" ({', '.join(names)})" if names else "")
-        )
+        due_status = now - self.last_status_refresh >= CFG["status_refresh_seconds"]
+        due_boards = now - self.last_leaderboards >= CFG["leaderboard_refresh_seconds"]
+        if self.dirty or due_status or due_boards:
+            self.refresh_cards(now, reposition=self.dirty)
+            self.last_status_refresh = now
+            if self.dirty or due_boards:
+                self.last_leaderboards = now
+            self.dirty = False
+            save_state(self.state)
 
-    for msg in messages:
-        post_discord(msg, dry_run)
+    def run_once(self):
+        self.replay()
+        now = time.time()
+        self.do_ping(now)
+        self.stats = load_stats()
+        self.check_milestones(all_playtimes(self.stats, self.state, now))
+        self.refresh_cards(now, reposition=False)
+        save_state(self.state)
 
-    # Session start times: current players keep theirs, new arrivals start now.
-    sessions = {n: sessions.get(n, epoch) for n in names}
-
-    update_weekly(state, names, epoch, dry_run, refresh_now=bool(messages))
-
-    # Concurrent-player record (records of 1 aren't worth announcing).
-    record = state.get("record_players", 0)
-    if count > record:
-        if count >= 2:
-            prev = f" (previous best: {record})" if record >= 2 else ""
-            post_discord(
-                f":tada: **New record!** {count} players online at once{prev}", dry_run
-            )
-        state["record_players"] = count
-
-    # Playtime milestones against all-time hours, announced once each.
-    announced = state.setdefault("milestones", {})
-    for n, secs in state.get("alltime_seconds", {}).items():
-        hours = secs / 3600
-        crossed = [m for m in MILESTONE_HOURS if hours >= m > announced.get(n, 0)]
-        if crossed:
-            top = max(crossed)
-            post_discord(
-                f":military_medal: **{n}** has now played over **{top} hours** on the server!",
-                dry_run,
-            )
-            announced[n] = top
-
-    # After event messages, repost the embed so it stays the newest message;
-    # on quiet checks, edit it in place so "last checked" stays current.
-    refresh_status_message(
-        state, True, count, players_info.get("max", "?"), names, dry_run,
-        reposition=bool(messages), sessions=sessions,
-    )
-
-    state["online"] = True
-    state["players"] = names
-    state["count"] = count
-    state["sessions"] = sessions
-    save_state(state)
+    def run(self):
+        log(f"[start] watching {CFG['server_dir']}", mirror=True)
+        self.replay()
+        self.reader.seek_end()
+        self.do_ping(time.time())
+        self.stats = load_stats()
+        self.check_milestones(all_playtimes(self.stats, self.state, time.time()))
+        self.dirty = True
+        while True:
+            try:
+                now = time.time()
+                for raw in self.reader.read_new():
+                    parsed = parse_line(raw)
+                    if parsed:
+                        self.handle(parsed[1], time.time())
+                self.tick(now)
+            except Exception as e:  # never let one bad cycle kill the watcher
+                log(f"[error] cycle failed: {e!r}", mirror=True)
+            time.sleep(CFG["log_poll_seconds"])
 
 
 def main():
-    dry_run = "--dry-run" in sys.argv
-    once = "--once" in sys.argv
+    global DRY_RUN
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--once", action="store_true", help="single pass, then exit")
+    ap.add_argument("--dry-run", action="store_true", help="post nothing")
+    args = ap.parse_args()
+    DRY_RUN = args.dry_run
 
-    if not dry_run and not WEBHOOK_URL:
-        sys.exit(
-            "DISCORD_WEBHOOK_URL is not set. Locally, run via run_local.sh; "
-            "on GitHub Actions, add it as a repository secret."
-        )
+    if not CFG["server_dir"] or not os.path.isdir(CFG["server_dir"]):
+        sys.exit(f"server_dir is not set or does not exist: {CFG['server_dir']!r}\n"
+                 f"Copy config.example.json to config.json and fill it in.")
+    if not DRY_RUN and not CFG["webhook_main"]:
+        sys.exit("webhook_main is not set in config.json.")
 
-    if once:
-        check_once(dry_run)
-        return
-
-    log(f"[start] watching {SERVER_ADDRESS} every {POLL_SECONDS}s")
-    while True:
+    bot = Bot()
+    if args.once:
+        bot.run_once()
+    else:
         try:
-            check_once(dry_run)
-        except Exception as e:  # keep the loop alive on any unexpected error
-            log(f"[error] check failed: {e}")
-        time.sleep(POLL_SECONDS)
+            bot.run()
+        except KeyboardInterrupt:
+            log("[stop] watcher stopped")
 
 
 if __name__ == "__main__":
