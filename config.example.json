@@ -8,6 +8,7 @@
   "webhook_weekly": "https://discord.com/api/webhooks/.../...",
   "webhook_logs": "https://discord.com/api/webhooks/.../...",
   "webhook_perf": "https://discord.com/api/webhooks/.../...",
+  "webhook_stats": "https://discord.com/api/webhooks/.../...",
 
   "down_mention": "@everyone",
   "down_after_seconds": 90,

@@ -18,6 +18,7 @@ sections and reports server-side numbers only.
 | `logs/latest.log` | joins, leaves, deaths, advancements, chat, start/stop — **within a second** |
 | status ping on `127.0.0.1:25565` | authoritative online count, version, MOTD, latency |
 | `world/players/stats/*.json` | **real** playtime, deaths, kills, blocks mined, distance, trades … |
+| `world/datapacks/*.zip` | which statistics the server tracks, and what to call them |
 | `world/players/advancements/*.json` | advancement counts |
 | `usercache.json` | UUID → name |
 
@@ -50,11 +51,34 @@ deaths, advancements, records, playtime milestones, and `@everyone 🔴 Server D
 card then re-posts after each event so it stays the newest message. Outages are recorded
 in the performance channel either way.
 
-**Leaderboard channel** (`webhook_weekly`) — three cards, all edited in place
-- 🏆 **Weekly Playtime** — resets Monday, with 🏁 **Final Standings** posted permanently
+**Leaderboard channel** (`webhook_weekly`) — three cards, in this order, edited in place
 - 👑 **All-Time Hours**
-- 📊 **Server Statistics** — blocks mined, mob kills, deaths, distance, advancements,
-  items crafted, villager trades, animals bred, fish caught, plus server-wide totals
+- 🏆 **Weekly Playtime** — resets Monday, with 🏁 **Final Standings** posted permanently
+- 📈 **This Week's Statistics** — only what has moved since the week began
+
+**Statistics channel** (`webhook_stats`) — every statistic the server tracks, all-time.
+
+The Vanilla Tweaks statistic datapacks declare a scoreboard objective per statistic,
+each bound to a vanilla criterion. Those criteria are read straight out of the datapack
+zips in `world/datapacks`, so this follows whatever is installed — add or remove a pack
+and the cards follow, with no list to maintain. Currently **216** distinct statistics.
+
+One card per category (General, Blocks Mined, Mobs Killed, Killed By, Items Used, Tools
+Broken, Items Crafted), each an aligned table inside a Discord ANSI code block, which is
+the only way to get columns that line up in a message:
+
+```
+Mob                    Leader           Kills
+─────────────────────────────────────────────
+Zombified Piglin       insaneff        11,299
+Cow                    owen1915         1,481
+Zombie                 owen1915           912
+```
+
+Each card lists the statistics nobody has scored yet, so the untouched ones are visible
+rather than merely absent, and a 🏛️ **Hall of Fame** card ranks players by how many
+statistics they lead. Categories too large for one message split across numbered cards
+rather than being silently truncated.
 
 **Performance channel** (`webhook_perf`) — a live 📈 **Performance** card, edited in place
 
@@ -104,6 +128,7 @@ Any setting can also be given as an environment variable: `MCBOT_RELAY_CHAT=1`,
 | `alert_disk_free_gb` | `15` | warn below this much free space |
 | `alert_heap_pct` | `92` | warn above this share of the java heap |
 | `daily_report` | `true` | post a summary of the previous day at midnight |
+| `stats_card_seconds` | `900` | how often to redraw the all-time statistic cards |
 
 ## Running as a service (Windows)
 

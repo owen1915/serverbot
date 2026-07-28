@@ -31,6 +31,7 @@ import time
 import urllib.error
 import urllib.request
 
+import gamestats
 import perf
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -39,6 +40,9 @@ STATE_FILE = os.path.join(HERE, "state.json")
 LOG_FILE = os.path.join(HERE, "mcbot.log")
 
 USER_AGENT = "mcbot/2.0 (local server watcher)"
+# Bumped when the set of cards in a channel changes, so the old ones are
+# cleared out and the new set is posted in the intended order.
+LAYOUT_VERSION = 2
 TICKS_PER_SECOND = 20
 
 # All-time playtime marks that earn a shout-out, in hours.
@@ -58,6 +62,7 @@ DEFAULTS = {
     "webhook_weekly": "",   # weekly + all-time + statistics leaderboards
     "webhook_logs": "",     # mirror of this bot's own log lines
     "webhook_perf": "",     # performance card, outage records, daily report
+    "webhook_stats": "",    # every tracked statistic, all-time, by category
     # Post join/leave/death/advancement/record/up-down messages to the main
     # channel. Off by default: that channel holds the status card and nothing
     # else, so the card stays put and never has to be re-posted.
@@ -83,6 +88,8 @@ DEFAULTS = {
     "stats_seconds": 60,
     "status_refresh_seconds": 90,
     "leaderboard_refresh_seconds": 600,
+    # The all-time statistic cards are large and move slowly.
+    "stats_card_seconds": 900,
     # Performance monitoring.
     "perf_sample_seconds": 30,
     "perf_card_seconds": 120,
@@ -428,7 +435,26 @@ def load_stats():
             "raid_wins": custom.get("minecraft:raid_win", 0),
             "advancements": count_advancements(uuid),
             "mtime": os.path.getmtime(path),
+            "raw": stats,  # every category, for the tracked-statistic cards
         }
+    return out
+
+
+def criterion_values(stats, criteria):
+    """{player: {criterion: value}} for every statistic the datapacks track."""
+    return {
+        name: {c: gamestats.value_of(entry.get("raw", {}), c) for c in criteria}
+        for name, entry in stats.items()
+    }
+
+
+def subtract(current, baseline):
+    """Per-player change since a baseline snapshot."""
+    out = {}
+    for name, values in current.items():
+        before = baseline.get(name, {})
+        out[name] = {c: v - before.get(c, 0) for c, v in values.items()
+                     if v - before.get(c, 0) > 0}
     return out
 
 
@@ -731,16 +757,6 @@ def rank_lines(pairs, fmt, limit=15, empty="*nothing recorded yet*"):
     return "\n".join(lines)
 
 
-def top_field(name, stats, key, fmt, limit=5):
-    pairs = [(n, s.get(key, 0)) for n, s in stats.items() if s.get(key, 0)]
-    if not pairs:
-        return None
-    pairs.sort(key=lambda kv: -kv[1])
-    body = "\n".join(f"{MEDALS[i] if i < 3 else '　'} {n} — {fmt(v)}"
-                     for i, (n, v) in enumerate(pairs[:limit]))
-    return {"name": name, "value": body, "inline": True}
-
-
 # ----------------------------------------------------------------- embeds --
 
 def status_embed(state, status, stats, now):
@@ -815,39 +831,6 @@ def alltime_embed(playtimes):
     }
 
 
-def stats_embed(stats):
-    """Real per-player statistics pulled out of the world save."""
-    fields = [
-        top_field("⛏️  Blocks Mined", stats, "mined", fmt_number),
-        top_field("⚔️  Mob Kills", stats, "mob_kills", fmt_number),
-        top_field("☠️  Deaths", stats, "deaths", fmt_number),
-        top_field("🥾  Distance", stats, "distance_cm", fmt_distance),
-        top_field("🏅  Advancements", stats, "advancements", fmt_number),
-        top_field("🔨  Items Crafted", stats, "crafted", fmt_number),
-        top_field("💰  Villager Trades", stats, "trades", fmt_number),
-        top_field("🐄  Animals Bred", stats, "animals_bred", fmt_number),
-        top_field("🎣  Fish Caught", stats, "fish_caught", fmt_number),
-    ]
-    fields = [f for f in fields if f]
-    totals = {
-        "blocks mined": sum(s["mined"] for s in stats.values()),
-        "mobs killed": sum(s["mob_kills"] for s in stats.values()),
-        "deaths": sum(s["deaths"] for s in stats.values()),
-        "advancements": sum(s["advancements"] for s in stats.values()),
-    }
-    summary = "  ·  ".join(f"**{fmt_number(v)}** {k}" for k, v in totals.items())
-    distance = sum(s["distance_cm"] for s in stats.values())
-    summary += f"  ·  **{fmt_distance(distance)}** travelled"
-    return {
-        "title": "📊  Server Statistics",
-        "description": f"### Server totals\n> {summary}",
-        "color": 0x3498DB,
-        "fields": fields,
-        "footer": {"text": f"{len(stats)} players tracked  •  from world/players/stats"},
-        "timestamp": now_iso(),
-    }
-
-
 # ------------------------------------------------------------------ state --
 
 def new_state():
@@ -858,6 +841,7 @@ def new_state():
         "play_time_at_join": {},   # name -> all-time seconds when they joined
         "week": None,
         "week_baseline": {},       # name -> all-time seconds at week start
+        "stat_baseline": {},       # name -> {criterion: value} at week start
         "msg": {},                 # card name -> Discord message id
         "msg_stale": {},           # card name -> ids still to be cleaned up
         "record_players": 0,
@@ -907,7 +891,15 @@ class Bot:
         self.last_external = 0.0
         self.last_perf_sample = 0.0
         self.last_perf_card = 0.0
+        self.last_stat_cards = 0.0
         self.status = None
+        # Read from the installed datapacks, so the cards track whatever is
+        # actually enabled in game rather than a list hardcoded here.
+        self.criteria = gamestats.load_criteria(CFG["server_dir"])
+        self.criterion_values = {}
+        if CFG["webhook_stats"]:
+            log(f"[stats] tracking {len(self.criteria)} statistics from the "
+                f"installed datapacks")
         self.perf = None
         if CFG["webhook_perf"]:
             if not perf.AVAILABLE:
@@ -922,8 +914,25 @@ class Bot:
 
     # -- log events -------------------------------------------------------
 
+    def migrate_layout(self):
+        """Re-lay-out a channel whose set of cards has changed.
+
+        Cards are edited in place, so their order in the channel is fixed when
+        they are first posted. Changing which cards belong there means deleting
+        them once and letting them come back in the new order.
+        """
+        if self.state.get("layout") == LAYOUT_VERSION or DRY_RUN:
+            return
+        for key in ("weekly", "alltime", "stats", "weekstats"):
+            mid = self.state["msg"].pop(key, None)
+            if mid and CFG["webhook_weekly"]:
+                _delete_message(CFG["webhook_weekly"], mid)
+        self.state["layout"] = LAYOUT_VERSION
+        log("[card] re-laid out the leaderboard channel", mirror=True)
+
     def sweep(self):
         """Clear out any duplicate cards left behind by an earlier run."""
+        self.migrate_layout()
         for url, key in ((CFG["webhook_main"], "status"),
                          (CFG["webhook_weekly"], "weekly"),
                          (CFG["webhook_weekly"], "alltime"),
@@ -1161,6 +1170,9 @@ class Bot:
                 f"{ {n: fmt_duration(s) for n, s in played.items()} }")
         else:
             state["week_baseline"] = dict(playtimes)
+        # Statistics have no equivalent of the log archive to recover from, so
+        # the week's counts necessarily start from wherever they stand now.
+        state["stat_baseline"] = {n: dict(v) for n, v in self.criterion_values.items()}
         state["week"] = key
         state["msg"].pop("weekly", None)
         return True
@@ -1203,13 +1215,48 @@ class Bot:
         rolled = self.roll_week(playtimes, now)
         for name in playtimes:
             state["week_baseline"].setdefault(name, playtimes[name])
+        # Seed any player the baseline has not seen yet — on the very first run
+        # that is everybody, so the week counts from now rather than crediting
+        # a lifetime of statistics to it.
+        for name, values in self.criterion_values.items():
+            state["stat_baseline"].setdefault(name, dict(values))
         url = CFG["webhook_weekly"]
-        upsert_embed(url, "weekly", state, weekly_embed(state, playtimes, now),
-                     reposition=rolled)
+        # All-time hours first, then this week's hours, then this week's
+        # statistics. Everything all-time lives in the statistics channel.
         upsert_embed(url, "alltime", state, alltime_embed(playtimes),
                      reposition=rolled)
-        upsert_embed(url, "stats", state, stats_embed(self.stats),
+        upsert_embed(url, "weekly", state, weekly_embed(state, playtimes, now),
                      reposition=rolled)
+        upsert_embed(url, "weekstats", state,
+                     gamestats.weekly_embed(
+                         self.criteria,
+                         subtract(self.criterion_values, state["stat_baseline"]),
+                         week_label(now)),
+                     reposition=rolled)
+
+    def refresh_stat_cards(self):
+        """The all-time statistic channel: an overview plus one card a category."""
+        url = CFG["webhook_stats"]
+        if not url or not self.criteria:
+            return
+        state = self.state
+        wanted = ["stat_overview"]
+        upsert_embed(url, "stat_overview", state,
+                     gamestats.overview_embed(self.criteria, self.criterion_values,
+                                              len(self.criterion_values)))
+        for key, embed in gamestats.category_embeds(self.criteria,
+                                                    self.criterion_values):
+            wanted.append(f"stat_{key}")
+            # Space the updates out: a webhook allows roughly five requests
+            # every two seconds, and this is a whole channel of cards at once.
+            time.sleep(0.4)
+            upsert_embed(url, f"stat_{key}", state, embed)
+        # A category can lose a page as its table shrinks; drop the leftover
+        # card rather than leaving stale numbers behind.
+        for key in [k for k in list(state["msg"])
+                    if k.startswith("stat_") and k not in wanted]:
+            if _delete_message(url, state["msg"].pop(key)):
+                log(f"[card] removed {key}, no longer needed")
 
     # -- main loop --------------------------------------------------------
 
@@ -1220,12 +1267,18 @@ class Bot:
         if now - self.last_stats >= CFG["stats_seconds"]:
             self.last_stats = now
             self.stats = load_stats()
+            self.criterion_values = criterion_values(self.stats, self.criteria)
             self.check_milestones(all_playtimes(self.stats, self.state, now))
         if (CFG["external_check"] and CFG["public_address"]
                 and now - self.last_external >= CFG["external_check_minutes"] * 60):
             self.last_external = now
             self.do_external_check()
         self.do_perf(now)
+        if (CFG["webhook_stats"]
+                and now - self.last_stat_cards >= CFG["stats_card_seconds"]):
+            self.last_stat_cards = now
+            self.refresh_stat_cards()
+            save_state(self.state)
 
         due_status = now - self.last_status_refresh >= CFG["status_refresh_seconds"]
         due_boards = now - self.last_leaderboards >= CFG["leaderboard_refresh_seconds"]
@@ -1243,6 +1296,7 @@ class Bot:
         now = time.time()
         self.do_ping(now)
         self.stats = load_stats()
+        self.criterion_values = criterion_values(self.stats, self.criteria)
         self.check_milestones(all_playtimes(self.stats, self.state, now))
         if self.perf:
             # CPU percentages and I/O rates are deltas between readings, so a
@@ -1255,6 +1309,7 @@ class Bot:
                     len(self.state["players"]))
             self.do_perf(time.time())
         self.refresh_cards(now, reposition=False)
+        self.refresh_stat_cards()
         save_state(self.state)
 
     def run(self):
@@ -1264,6 +1319,7 @@ class Bot:
         self.reader.seek_end()
         self.do_ping(time.time())
         self.stats = load_stats()
+        self.criterion_values = criterion_values(self.stats, self.criteria)
         self.check_milestones(all_playtimes(self.stats, self.state, time.time()))
         self.dirty = True
         while True:

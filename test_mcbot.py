@@ -216,6 +216,62 @@ def test_availability():
     check("a brief outage is recorded", round(downtime), 30)
 
 
+def test_weekly_statistic_deltas():
+    """This week's statistics are a change since a baseline, not a total.
+
+    With no baseline every lifetime total reads as this week's activity, so the
+    baseline must be seeded for every player before the card is drawn.
+    """
+    current = {"ann": {"mined": 100, "kills": 5}, "bob": {"mined": 7}}
+    baseline = {"ann": {"mined": 90, "kills": 5}, "bob": {"mined": 7}}
+    got = mcbot.subtract(current, baseline)
+    check("only the increase counts", got["ann"], {"mined": 10})
+    check("statistics that did not move are dropped", "kills" in got["ann"], False)
+    check("a player who did nothing has an empty row", got["bob"], {})
+
+    # An unseeded player is credited everything — which is exactly why
+    # refresh_cards seeds the baseline for every player it sees.
+    unseeded = mcbot.subtract({"cat": {"mined": 500}}, {})
+    check("an unseeded player would be credited their whole history",
+          unseeded["cat"], {"mined": 500})
+
+
+def test_statistic_criteria():
+    """Criteria come from the datapacks and resolve into the stats files."""
+    import gamestats
+    check("a kill criterion resolves",
+          gamestats.split_criterion("minecraft.killed:minecraft.cave_spider"),
+          ("minecraft:killed", "minecraft:cave_spider"))
+    check("a bare criterion resolves",
+          gamestats.split_criterion("deathCount"),
+          ("minecraft:custom", "minecraft:deaths"))
+    check("names are humanised",
+          gamestats.display_name("minecraft.killed:minecraft.cave_spider"),
+          "Cave Spider")
+    check("interaction prefixes are dropped",
+          gamestats.display_name("minecraft.custom:minecraft.interact_with_furnace"),
+          "Furnace")
+    check("distances are read off a real stats file",
+          gamestats.value_of({"minecraft:custom": {"minecraft:walk_one_cm": 250_000}},
+                             "minecraft.custom:minecraft.walk_one_cm"), 250_000)
+    check("distances format as kilometres",
+          gamestats.format_value("minecraft.custom:minecraft.walk_one_cm", 250_000),
+          "2.5km")
+    check("playtime formats as hours",
+          gamestats.format_value("minecraft.custom:minecraft.play_time", 72_000 * 20),
+          "20.0h")
+    check("counts stay counts",
+          gamestats.format_value("minecraft.killed:minecraft.zombie", 1234), "1,234")
+
+    per_player = {"ann": {"minecraft.killed:minecraft.zombie": 10},
+                  "bob": {"minecraft.killed:minecraft.zombie": 3}}
+    rows = gamestats.leaders(["minecraft.killed:minecraft.zombie"], per_player)
+    check("the leader is the highest scorer", rows[0][1], "ann")
+    check("statistics nobody scored are listed as untouched",
+          gamestats.untouched(["minecraft.killed:minecraft.warden"], per_player),
+          ["Warden"])
+
+
 def main():
     test_reader()
     print()
@@ -226,6 +282,10 @@ def main():
     test_lag_parsing()
     print()
     test_availability()
+    print()
+    test_weekly_statistic_deltas()
+    print()
+    test_statistic_criteria()
     print()
     if failures:
         print(f"{len(failures)} FAILED: {', '.join(failures)}")
