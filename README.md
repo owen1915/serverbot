@@ -1,8 +1,15 @@
 # mcbot — Minecraft server → Discord
 
 Runs **on the machine hosting the Minecraft server** and reads the server's own data
-instead of a third-party status API. Python 3 standard library only — no dependencies,
-no bot token, no plugin.
+instead of a third-party status API. No bot token and no plugin; the standard library
+covers everything except the host performance metrics, which use `psutil`:
+
+```
+pip install psutil
+```
+
+Without it the bot still runs — the performance card just drops the host and process
+sections and reports server-side numbers only.
 
 ## Where the data comes from
 
@@ -21,24 +28,51 @@ counter, so they include history from before this bot existed.
 
 ## What it posts
 
-**Main channel** (`webhook_main`)
-- a live status card — who is on, this session's time, their all-time hours, server
-  version, uptime and ping. Edited in place on quiet checks, re-posted after events so
-  it stays the newest message.
-- `➡️ Name joined the server (2 online) — 16h 32m all-time`
-- `⬅️ Name left the server (1 online) — was on for 2h 15m`
-- `💀 Name was blown up by Creeper`
-- `🎖️ Name earned the advancement [Diamonds!]`
-- `🎉 New record! N players online at once`
-- `🎖️ Name has now played over 50 hours on the server!`
-- `@everyone 🔴 Server DOWN` after ~90s of failed pings; `🟢 Server UP` on recovery
-- `⚠️ running but unreachable from the internet` if the port stops forwarding
+**Main channel** (`webhook_main`) — **one message, and only one**: a live status card
+showing who is online and how long each of them has been on, plus the server version,
+uptime and ping.
+
+```
+🟢  Server Online
+### Players Online — 2/1000
+> 🎮  Joksuu_      ·  on for 1h 12m
+> 🎮  PowerRubik   ·  on for 24m
+71.176.227.214:25565 • Minecraft 26.2 • up 9h 4m • 4 ms • last checked
+```
+
+The card is never re-posted — it is edited in place, across restarts and server
+shutdowns alike, so the channel never accumulates duplicates. Every id this bot posts is
+persisted before anything else happens, and any card it loses track of is deleted on the
+next start.
+
+Setting `main_events` to `true` restores the event stream in this channel (joins, leaves,
+deaths, advancements, records, playtime milestones, and `@everyone 🔴 Server DOWN`); the
+card then re-posts after each event so it stays the newest message. Outages are recorded
+in the performance channel either way.
 
 **Leaderboard channel** (`webhook_weekly`) — three cards, all edited in place
 - 🏆 **Weekly Playtime** — resets Monday, with 🏁 **Final Standings** posted permanently
 - 👑 **All-Time Hours**
 - 📊 **Server Statistics** — blocks mined, mob kills, deaths, distance, advancements,
   items crafted, villager trades, animals bred, fish caught, plus server-wide totals
+
+**Performance channel** (`webhook_perf`) — a live 📈 **Performance** card, edited in place
+
+- *server* — status-ping latency with a sparkline and hourly average, and any
+  "Can't keep up!" tick overruns the server has logged
+- *availability* — uptime over 24h / 7d / 30d, plus the last outage and its duration.
+  Time when the watcher itself was not running is recorded as **unknown** and excluded,
+  so a short history cannot masquerade as a perfect month
+- *Minecraft process* — CPU share of the machine, resident memory against the `-Xmx`
+  heap (detected from the running process), thread count, process uptime
+- *host* — CPU across all cores, RAM, free disk on the world's drive, network and disk
+  throughput, and how long the PC has been up
+
+It also posts outage records (`🔴 Outage began` / `🟢 Recovered after 12m`), a
+🗓️ **Daily Report** at midnight with the previous day's uptime, peak players, average
+and peak CPU/RAM and lag events, and threshold alerts for sustained high CPU, memory
+pressure, low disk and heap pressure. Alerts never ping anyone and are rate-limited to
+one per condition every 30 minutes.
 
 **Log channel** (`webhook_logs`) — the watcher's own significant log lines.
 
@@ -56,12 +90,20 @@ Any setting can also be given as an environment variable: `MCBOT_RELAY_CHAT=1`,
 
 | Key | Default | Meaning |
 | --- | --- | --- |
+| `main_events` | `false` | post events to the main channel, not just the status card |
 | `relay_chat` | `false` | mirror in-game chat into the main channel |
-| `announce_deaths` | `true` | post death messages |
-| `announce_advancements` | `true` | post advancement messages |
+| `announce_deaths` | `true` | post death messages (needs `main_events`) |
+| `announce_advancements` | `true` | post advancement messages (needs `main_events`) |
 | `down_mention` | `@everyone` | who to ping when the server goes down (`""` for nobody) |
 | `down_after_seconds` | `90` | failed-ping time before announcing DOWN |
 | `external_check` | `true` | also ping `public_address` to catch port-forwarding breaking |
+| `perf_sample_seconds` | `30` | how often to read the host and process metrics |
+| `perf_card_seconds` | `120` | how often to redraw the performance card |
+| `perf_alerts` | `true` | post threshold alerts to the performance channel |
+| `alert_host_cpu` / `alert_host_ram` | `90` / `92` | percent, sustained over five samples |
+| `alert_disk_free_gb` | `15` | warn below this much free space |
+| `alert_heap_pct` | `92` | warn above this share of the java heap |
+| `daily_report` | `true` | post a summary of the previous day at midnight |
 
 ## Running as a service (Windows)
 
@@ -85,9 +127,11 @@ bot rebuilds who is online by replaying `latest.log` and re-posts its cards.
 python test_mcbot.py
 ```
 
-Covers following `latest.log` across appends, partial writes, UTF-8 chat and rotation,
-and the classification of log lines (a creeper kill is a death; a `SulfurCube` dying is
-not). No server or network needed.
+Covers following `latest.log` across appends, partial writes, UTF-8 chat and rotation;
+the classification of log lines (a creeper kill is a death; a `SulfurCube` dying is not);
+Bedrock names carrying Floodgate's `.` prefix; both wordings of the server's lag warning;
+and the availability ledger, including that a gap in sampling is reported as unknown
+rather than counted as uptime. No server or network needed.
 
 ## Notes
 

@@ -31,6 +31,8 @@ import time
 import urllib.error
 import urllib.request
 
+import perf
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(HERE, "config.json")
 STATE_FILE = os.path.join(HERE, "state.json")
@@ -55,7 +57,14 @@ DEFAULTS = {
     "webhook_main": "",     # status card + join/leave/death/advancement events
     "webhook_weekly": "",   # weekly + all-time + statistics leaderboards
     "webhook_logs": "",     # mirror of this bot's own log lines
+    "webhook_perf": "",     # performance card, outage records, daily report
+    # Post join/leave/death/advancement/record/up-down messages to the main
+    # channel. Off by default: that channel holds the status card and nothing
+    # else, so the card stays put and never has to be re-posted.
+    "main_events": False,
     # Who to ping when the server goes down: "@everyone", "@here", "<@id>", "".
+    # Only used when main_events is on; outages are always recorded in the
+    # performance channel regardless.
     "down_mention": "@everyone",
     # Seconds of failed pings before announcing the server is down.
     "down_after_seconds": 90,
@@ -74,6 +83,15 @@ DEFAULTS = {
     "stats_seconds": 60,
     "status_refresh_seconds": 90,
     "leaderboard_refresh_seconds": 600,
+    # Performance monitoring.
+    "perf_sample_seconds": 30,
+    "perf_card_seconds": 120,
+    "perf_alerts": True,
+    "alert_host_cpu": 90,       # percent, sustained over five samples
+    "alert_host_ram": 92,       # percent, sustained over five samples
+    "alert_disk_free_gb": 15,
+    "alert_heap_pct": 92,       # percent of the java heap in use
+    "daily_report": True,
 }
 
 
@@ -170,7 +188,9 @@ def discord(url, method="POST", payload=None, retries=3):
 
 
 def say(content):
-    """Post an event message to the main channel."""
+    """Post an event message to the main channel, if those are enabled."""
+    if not CFG["main_events"]:
+        return
     if DRY_RUN:
         log(f"[dry-run] {content}")
         return
@@ -185,11 +205,63 @@ def say(content):
         log(f"[error] could not post to main channel: {e}")
 
 
-def upsert_embed(url, state_key, state, embed, reposition=False):
-    """Keep a single embed message current.
+def perf_say(content):
+    """Post to the performance channel. Never pings anybody."""
+    if not CFG["webhook_perf"]:
+        return
+    if DRY_RUN:
+        log(f"[dry-run][perf] {content}")
+        return
+    try:
+        discord(CFG["webhook_perf"], "POST", {
+            "content": content,
+            "username": "MC Performance",
+            "allowed_mentions": {"parse": []},
+        })
+        log(f"[perf] {content}", mirror=True)
+    except (urllib.error.URLError, OSError) as e:
+        log(f"[error] could not post to the performance channel: {e}")
 
-    Edits it in place, or deletes and re-posts it when reposition is set so the
-    card stays the newest message in the channel after event messages.
+
+def _delete_message(url, mid):
+    """True if the message is gone (deleted now, or already absent)."""
+    try:
+        discord(f"{url}/messages/{mid}", "DELETE")
+        return True
+    except urllib.error.HTTPError as e:
+        return e.code == 404  # already gone is success
+    except (urllib.error.URLError, OSError):
+        return False
+
+
+def sweep_stale(url, state_key, state):
+    """Delete cards this bot posted but lost track of.
+
+    A card whose id was never persisted — the process was killed between
+    posting and saving — would otherwise sit in the channel forever as a
+    duplicate. Every id is recorded before it is replaced, and retried here.
+    """
+    stale = state.setdefault("msg_stale", {}).get(state_key, [])
+    if not stale:
+        return
+    current = state["msg"].get(state_key)
+    remaining = []
+    for mid in stale:
+        if mid == current:
+            continue
+        if not _delete_message(url, mid):
+            remaining.append(mid)
+        else:
+            log(f"[card] removed a stale {state_key} card")
+    state["msg_stale"][state_key] = remaining
+
+
+def upsert_embed(url, state_key, state, embed, reposition=False):
+    """Keep exactly one embed message current.
+
+    Normally the message is edited in place, which is what keeps it unique.
+    reposition deletes and re-posts it, used only where the card must become
+    the newest message in its channel again.
     """
     if DRY_RUN:
         log(f"[dry-run] embed {state_key}: {embed.get('title')}")
@@ -207,18 +279,18 @@ def upsert_embed(url, state_key, state, embed, reposition=False):
         except (urllib.error.URLError, OSError) as e:
             log(f"[warn] could not edit {state_key}: {e}")
             return
-    if mid and reposition:
-        try:
-            discord(f"{url}/messages/{mid}", "DELETE")
-        except urllib.error.HTTPError as e:
-            if e.code != 404:
-                log(f"[warn] could not delete old {state_key}: {e}")
-        except (urllib.error.URLError, OSError) as e:
-            log(f"[warn] could not delete old {state_key}: {e}")
+    if mid and reposition and not _delete_message(url, mid):
+        log(f"[warn] could not delete old {state_key}; will retry as stale")
+        state.setdefault("msg_stale", {}).setdefault(state_key, []).append(mid)
     try:
+        # Record the id before the request, so a crash between posting and
+        # saving leaves a lead to clean up rather than an orphan.
+        state.setdefault("msg_stale", {}).setdefault(state_key, [])
         resp = discord(url + "?wait=true", "POST",
                        {"username": "MC Server", "embeds": [embed]})
         state["msg"][state_key] = resp["id"]
+        state["msg_stale"][state_key].append(resp["id"])
+        save_state(state)  # persist immediately; a kill must not orphan this
         log(f"[card] posted {state_key}")
     except (urllib.error.URLError, OSError) as e:
         log(f"[error] could not post {state_key}: {e}")
@@ -400,16 +472,24 @@ def all_playtimes(stats, state, now):
 # ------------------------------------------------------------- log reading --
 
 LINE_RE = re.compile(r"^\[(\d{2}):(\d{2}):(\d{2})\] \[[^\]]*\]: (.*)$")
-JOIN_RE = re.compile(r"^(\w{1,16}) joined the game$")
-LEAVE_RE = re.compile(r"^(\w{1,16}) left the game$")
-CHAT_RE = re.compile(r"^<(\w{1,16})> (.+)$")
+# Java names are word characters, but Floodgate prefixes Bedrock players with
+# a configurable character (".by default"), so allow a leading punctuation mark.
+NAME = r"[.\w]{1,20}"
+JOIN_RE = re.compile(rf"^({NAME}) joined the game$")
+LEAVE_RE = re.compile(rf"^({NAME}) left the game$")
+CHAT_RE = re.compile(rf"^<({NAME})> (.+)$")
 ADV_RE = re.compile(
-    r"^(\w{1,16}) has (?:made the advancement|completed the challenge|reached the goal) \[(.+)\]$")
+    rf"^({NAME}) has (?:made the advancement|completed the challenge|reached the goal) \[(.+)\]$")
 START_RE = re.compile(r'^Done \([^)]*\)! For help, type')
 STOP_RE = re.compile(r"^Stopping the server$")
+# The server's own complaint when a tick takes too long. Two wordings exist
+# across versions ("Running 2145ms or 42 ticks behind" and "Running 2145ms
+# behind, skipping 42 tick(s)"), so match the milliseconds and find the ticks.
+LAG_RE = re.compile(r"Can't keep up!.*?Running (\d+)\s*ms", re.I)
+LAG_TICKS_RE = re.compile(r"(\d+)\s*tick")
 # Lines that begin with a player name but are not deaths.
 NOT_DEATH_RE = re.compile(
-    r"^\w{1,16} (?:joined the game|left the game|lost connection|"
+    r"^[.\w]{1,20} (?:joined the game|left the game|lost connection|"
     r"has made the advancement|has completed the challenge|has reached the goal|"
     r"issued server command|moved too quickly|moved wrongly|"
     r"was kicked|tried to swim in lava to escape)")
@@ -681,7 +761,6 @@ def status_embed(state, status, stats, now):
         rows = sorted(state["players"].items(), key=lambda kv: kv[1])
         body = "\n".join(
             f"> 🎮  **{n}**  ·  on for {fmt_duration(now - start)}"
-            f"  ·  {fmt_duration(live_playtime(stats, state, n, now))} all-time"
             for n, start in rows)
     elif players.get("online", 0):
         body = f"> 🎮  {players['online']} online"
@@ -780,12 +859,14 @@ def new_state():
         "week": None,
         "week_baseline": {},       # name -> all-time seconds at week start
         "msg": {},                 # card name -> Discord message id
+        "msg_stale": {},           # card name -> ids still to be cleaned up
         "record_players": 0,
         "milestones": {},
         "milestones_initialised": False,
         "server_start": None,
         "external_ok": None,
         "down_since": None,
+        "perf": {},                # performance history and the uptime ledger
     }
 
 
@@ -801,6 +882,10 @@ def load_state():
 
 
 def save_state(state):
+    # A dry run must not persist anything: it may well be running alongside the
+    # real watcher, which owns this file.
+    if DRY_RUN:
+        return
     tmp = STATE_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2)
@@ -820,9 +905,32 @@ class Bot:
         self.last_status_refresh = 0.0
         self.last_leaderboards = 0.0
         self.last_external = 0.0
+        self.last_perf_sample = 0.0
+        self.last_perf_card = 0.0
         self.status = None
+        self.perf = None
+        if CFG["webhook_perf"]:
+            if not perf.AVAILABLE:
+                log("[warn] psutil is not installed — the performance card will "
+                    "show server metrics only. Fix with: pip install psutil")
+            self.perf = perf.Monitor(
+                self.state.setdefault("perf", {}),
+                CFG["server_dir"],
+                heap_max_bytes=perf.detect_heap_max(CFG["server_dir"]),
+                log=log,
+            )
 
     # -- log events -------------------------------------------------------
+
+    def sweep(self):
+        """Clear out any duplicate cards left behind by an earlier run."""
+        for url, key in ((CFG["webhook_main"], "status"),
+                         (CFG["webhook_weekly"], "weekly"),
+                         (CFG["webhook_weekly"], "alltime"),
+                         (CFG["webhook_weekly"], "stats"),
+                         (CFG["webhook_perf"], "perf")):
+            if url and not DRY_RUN:
+                sweep_stale(url, key, self.state)
 
     def replay(self):
         """Rebuild the online set and session starts from latest.log, silently."""
@@ -897,6 +1005,15 @@ class Bot:
             self.dirty = True
             return
 
+        m = LAG_RE.search(msg)
+        if m:
+            ticks = LAG_TICKS_RE.search(msg)
+            behind = int(m.group(1))
+            if self.perf:
+                self.perf.record_lag(now, behind, int(ticks.group(1)) if ticks else 0)
+            log(f"[perf] server fell {behind} ms behind", mirror=True)
+            return
+
         m = ADV_RE.match(msg)
         if m and CFG["announce_advancements"]:
             name, adv = m.group(1), m.group(2)
@@ -936,8 +1053,12 @@ class Bot:
         state = self.state
         if self.status:
             if state["online"] is False:
+                outage = now - state["down_since"] if state["down_since"] else None
                 say(f":green_circle: **Server UP** — "
                     f"`{CFG['public_address'] or CFG['host']}` is responding again.")
+                perf_say(f":green_circle: **Recovered** after "
+                         f"**{fmt_duration(outage)}** of downtime."
+                         if outage else ":green_circle: **Recovered.**")
                 self.dirty = True
             state["online"] = True
             state["down_since"] = None
@@ -950,6 +1071,9 @@ class Bot:
             mention = (CFG["down_mention"] + " ") if CFG["down_mention"] else ""
             say(f"{mention}:red_circle: **Server DOWN** — "
                 f"`{CFG['public_address'] or CFG['host']}` is not responding.")
+            perf_say(f":red_circle: **Outage began** at "
+                     f"{time.strftime('%H:%M:%S', time.localtime(state['down_since']))} "
+                     f"— the server stopped responding.")
             state["online"] = False
             state["players"] = {}
             self.dirty = True
@@ -970,6 +1094,40 @@ class Bot:
         elif was is False and reachable:
             say(f":white_check_mark: `{address}` is reachable from the internet again.")
             self.dirty = True
+
+    def do_perf(self, now):
+        """Sample the machine, raise alerts, and keep the performance card fresh."""
+        if not self.perf:
+            return
+        if now - self.last_perf_sample >= CFG["perf_sample_seconds"]:
+            self.last_perf_sample = now
+            latency = self.status.get("_latency_ms") if self.status else None
+            self.perf.sample(now, latency, len(self.state["players"]))
+            if CFG["perf_alerts"]:
+                for message in self.perf.check_alerts(now, {
+                    "host_cpu": CFG["alert_host_cpu"],
+                    "host_ram": CFG["alert_host_ram"],
+                    "disk_free_gb": CFG["alert_disk_free_gb"],
+                    "heap_pct": CFG["alert_heap_pct"],
+                }):
+                    perf_say(message)
+            if CFG["daily_report"]:
+                finished = self.perf.rolled_over_day()
+                if finished and not DRY_RUN and CFG["webhook_perf"]:
+                    try:
+                        discord(CFG["webhook_perf"], "POST", {
+                            "username": "MC Performance",
+                            "embeds": [self.perf.daily_embed(finished, now)]})
+                        log(f"[perf] posted the daily report for {finished['day']}",
+                            mirror=True)
+                    except (urllib.error.URLError, OSError) as e:
+                        log(f"[error] daily report post failed: {e}")
+
+        if now - self.last_perf_card >= CFG["perf_card_seconds"]:
+            self.last_perf_card = now
+            address = CFG["public_address"] or f"{CFG['host']}:{CFG['port']}"
+            upsert_embed(CFG["webhook_perf"], "perf", self.state,
+                         self.perf.embed(now, address))
 
     def roll_week(self, playtimes, now):
         """Post final standings and reset the weekly baseline every Monday."""
@@ -1031,9 +1189,12 @@ class Bot:
         playtimes = all_playtimes(self.stats, state, now)
 
         if CFG["webhook_main"]:
+            # The status card is only ever moved when the main channel also
+            # carries event messages; otherwise it is edited in place forever,
+            # which is what guarantees there is exactly one of it.
             upsert_embed(CFG["webhook_main"], "status", state,
                          status_embed(state, self.status, self.stats, now),
-                         reposition=reposition)
+                         reposition=reposition and CFG["main_events"])
         if not CFG["webhook_weekly"]:
             return
         rolled = self.roll_week(playtimes, now)
@@ -1061,6 +1222,7 @@ class Bot:
                 and now - self.last_external >= CFG["external_check_minutes"] * 60):
             self.last_external = now
             self.do_external_check()
+        self.do_perf(now)
 
         due_status = now - self.last_status_refresh >= CFG["status_refresh_seconds"]
         due_boards = now - self.last_leaderboards >= CFG["leaderboard_refresh_seconds"]
@@ -1073,16 +1235,28 @@ class Bot:
             save_state(self.state)
 
     def run_once(self):
+        self.sweep()
         self.replay()
         now = time.time()
         self.do_ping(now)
         self.stats = load_stats()
         self.check_milestones(all_playtimes(self.stats, self.state, now))
+        if self.perf:
+            # CPU percentages and I/O rates are deltas between readings, so a
+            # single sample would have nothing to compare against.
+            for _ in range(3):
+                time.sleep(1)
+                self.perf.sample(
+                    time.time(),
+                    self.status.get("_latency_ms") if self.status else None,
+                    len(self.state["players"]))
+            self.do_perf(time.time())
         self.refresh_cards(now, reposition=False)
         save_state(self.state)
 
     def run(self):
         log(f"[start] watching {CFG['server_dir']}", mirror=True)
+        self.sweep()
         self.replay()
         self.reader.seek_end()
         self.do_ping(time.time())

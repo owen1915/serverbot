@@ -7,10 +7,21 @@
   "webhook_main": "https://discord.com/api/webhooks/.../...",
   "webhook_weekly": "https://discord.com/api/webhooks/.../...",
   "webhook_logs": "https://discord.com/api/webhooks/.../...",
+  "webhook_perf": "https://discord.com/api/webhooks/.../...",
 
   "down_mention": "@everyone",
   "down_after_seconds": 90,
 
+  "perf_sample_seconds": 30,
+  "perf_card_seconds": 120,
+  "perf_alerts": true,
+  "alert_host_cpu": 90,
+  "alert_host_ram": 92,
+  "alert_disk_free_gb": 15,
+  "alert_heap_pct": 92,
+  "daily_report": true,
+
+  "main_events": false,
   "relay_chat": false,
   "announce_deaths": true,
   "announce_advancements": true,

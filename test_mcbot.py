@@ -85,6 +85,7 @@ def test_events():
     bot.state = mcbot.new_state()
     bot.stats = {}
     bot.dirty = False
+    bot.perf = None
 
     posted = []
     original_say = mcbot.say
@@ -122,10 +123,109 @@ def test_events():
     check("online set correct at the end", sorted(bot.state["players"]), ["owen1915"])
 
 
+def test_bedrock_names():
+    """Floodgate prefixes Bedrock players with '.', which must not be skipped."""
+    bot = mcbot.Bot.__new__(mcbot.Bot)
+    bot.state = mcbot.new_state()
+    bot.stats = {}
+    bot.dirty = False
+    bot.perf = None
+
+    posted = []
+    original_say = mcbot.say
+    mcbot.say = posted.append
+    try:
+        for message in [
+            ".BedrockKid joined the game",
+            ".BedrockKid has made the advancement [Stone Age]",
+            ".BedrockKid was slain by Zombie",
+            ".BedrockKid left the game",
+        ]:
+            bot.handle(message, 1000.0)
+    finally:
+        mcbot.say = original_say
+
+    check("bedrock join announced", sum("joined the server" in p for p in posted), 1)
+    check("bedrock advancement announced", sum("Stone Age" in p for p in posted), 1)
+    check("bedrock death announced", sum("slain by Zombie" in p for p in posted), 1)
+    check("bedrock leave announced", sum("left the server" in p for p in posted), 1)
+    check("bedrock player removed from the online set", bot.state["players"], {})
+
+
+def test_lag_parsing():
+    """Both wordings of the server's 'Can't keep up!' warning must parse."""
+    recorded = []
+
+    class Recorder:
+        def record_lag(self, now, ms, ticks):
+            recorded.append((ms, ticks))
+
+    bot = mcbot.Bot.__new__(mcbot.Bot)
+    bot.state = mcbot.new_state()
+    bot.stats = {}
+    bot.dirty = False
+    bot.perf = Recorder()
+
+    original_say = mcbot.say
+    mcbot.say = lambda c: None
+    try:
+        bot.handle("Can't keep up! Is the server overloaded? "
+                   "Running 2145ms or 42 ticks behind", 1000.0)
+        bot.handle("Can't keep up! Did the system time change, or is the server "
+                   "overloaded? Running 5000ms behind, skipping 100 tick(s)", 1000.0)
+    finally:
+        mcbot.say = original_say
+
+    check("both lag wordings parsed", recorded, [(2145, 42), (5000, 100)])
+
+
+def test_availability():
+    """Uptime must be measured over observed time, not assumed for gaps."""
+    import perf
+    now = 1_000_000.0
+    hour = 3600.0
+
+    # Four hours of ordinary 30-second sampling, the third hour spent down.
+    ledger = perf.Availability({})
+    moment = now - 4 * hour
+    while moment <= now:
+        down = now - 2 * hour <= moment < now - 1 * hour
+        ledger.observe(not down, moment)
+        moment += 30
+
+    pct, observed, downtime = ledger.summary(4 * hour, now)
+    check("an hour of downtime is measured", round(downtime / 60), 60)
+    check("uptime is 75% of a four-hour window", round(pct), 75)
+    check("the whole window counts as observed", round(observed / hour), 4)
+
+    # A blind spot must count as unknown rather than silently as uptime.
+    gapped = perf.Availability({})
+    gapped.observe(True, now - 4 * hour)
+    gapped.observe(True, now)
+    pct, observed, _ = gapped.summary(4 * hour, now)
+    check("a sampling gap is not counted as observed", round(observed), 0)
+    check("uptime is unknown rather than a claimed 100%", pct, None)
+
+    # An outage shorter than the sampling interval still lands in the ledger.
+    brief = perf.Availability({})
+    brief.observe(True, now - 120)
+    brief.observe(False, now - 90)
+    brief.observe(True, now - 60)
+    brief.observe(True, now)
+    _, _, downtime = brief.summary(300, now)
+    check("a brief outage is recorded", round(downtime), 30)
+
+
 def main():
     test_reader()
     print()
     test_events()
+    print()
+    test_bedrock_names()
+    print()
+    test_lag_parsing()
+    print()
+    test_availability()
     print()
     if failures:
         print(f"{len(failures)} FAILED: {', '.join(failures)}")
