@@ -42,7 +42,7 @@ LOG_FILE = os.path.join(HERE, "mcbot.log")
 USER_AGENT = "mcbot/2.0 (local server watcher)"
 # Bumped when the set of cards in a channel changes, so the old ones are
 # cleared out and the new set is posted in the intended order.
-LAYOUT_VERSION = 2
+LAYOUT_VERSION = 3
 TICKS_PER_SECOND = 20
 
 # All-time playtime marks that earn a shout-out, in hours.
@@ -90,6 +90,10 @@ DEFAULTS = {
     "leaderboard_refresh_seconds": 600,
     # The all-time statistic cards are large and move slowly.
     "stats_card_seconds": 900,
+    # Cap rows per statistic category; 0 shows every recorded statistic. The
+    # save holds a couple of thousand, which is a lot of cards — set this to
+    # something like 40 to keep the channel to the headline figures.
+    "stats_top_per_category": 0,
     # Performance monitoring.
     "perf_sample_seconds": 30,
     "perf_card_seconds": 120,
@@ -230,6 +234,20 @@ def perf_say(content):
         log(f"[error] could not post to the performance channel: {e}")
 
 
+def webhook_for(card):
+    """Which channel a card belongs to, by its state key."""
+    if card.startswith("stat_"):
+        return CFG["webhook_stats"]
+    return {
+        "status": CFG["webhook_main"],
+        "perf": CFG["webhook_perf"],
+        "weekly": CFG["webhook_weekly"],
+        "alltime": CFG["webhook_weekly"],
+        "weekstats": CFG["webhook_weekly"],
+        "stats": CFG["webhook_weekly"],  # retired card, kept so it can be swept
+    }.get(card, "")
+
+
 def _delete_message(url, mid):
     """True if the message is gone (deleted now, or already absent)."""
     try:
@@ -256,6 +274,7 @@ def sweep_stale(url, state_key, state):
     for mid in stale:
         if mid == current:
             continue
+        time.sleep(0.3)  # stay inside the webhook rate limit
         if not _delete_message(url, mid):
             remaining.append(mid)
         else:
@@ -893,13 +912,12 @@ class Bot:
         self.last_perf_card = 0.0
         self.last_stat_cards = 0.0
         self.status = None
-        # Read from the installed datapacks, so the cards track whatever is
-        # actually enabled in game rather than a list hardcoded here.
-        self.criteria = gamestats.load_criteria(CFG["server_dir"])
+        # The datapacks' objectives are a curated goal list, used to say which
+        # goals are still unmet. What gets *shown* comes from the save itself,
+        # which records every statistic whether a datapack names it or not.
+        self.curated = gamestats.load_criteria(CFG["server_dir"])
+        self.criteria = []
         self.criterion_values = {}
-        if CFG["webhook_stats"]:
-            log(f"[stats] tracking {len(self.criteria)} statistics from the "
-                f"installed datapacks")
         self.perf = None
         if CFG["webhook_perf"]:
             if not perf.AVAILABLE:
@@ -914,6 +932,27 @@ class Bot:
 
     # -- log events -------------------------------------------------------
 
+    def refresh_criteria(self):
+        """Rebuild the statistic set from the save, plus the curated goals.
+
+        The save only stores non-zero entries, so this grows as players do new
+        things. The curated list is merged in so unmet goals still get named.
+        """
+        observed = gamestats.observed_criteria(self.stats)
+        seen, merged = set(), []
+        for criterion in list(observed) + list(self.curated):
+            resolved = gamestats.split_criterion(criterion)
+            if resolved and resolved not in seen:
+                seen.add(resolved)
+                merged.append(criterion)
+        before = len(self.criteria)
+        self.criteria = merged
+        self.criterion_values = criterion_values(self.stats, self.criteria)
+        if CFG["webhook_stats"] and len(merged) != before:
+            log(f"[stats] {len(merged)} statistics recorded "
+                f"({len(observed)} in the world save, "
+                f"{len(self.curated)} datapack goals)")
+
     def migrate_layout(self):
         """Re-lay-out a channel whose set of cards has changed.
 
@@ -927,18 +966,29 @@ class Bot:
             mid = self.state["msg"].pop(key, None)
             if mid and CFG["webhook_weekly"]:
                 _delete_message(CFG["webhook_weekly"], mid)
+        # Statistic cards gain and lose pages as categories grow, and new pages
+        # would otherwise land at the bottom of the channel instead of after
+        # the category they belong to.
+        for key in [k for k in list(self.state["msg"]) if k.startswith("stat_")]:
+            mid = self.state["msg"].pop(key)
+            if mid and CFG["webhook_stats"]:
+                time.sleep(0.3)
+                _delete_message(CFG["webhook_stats"], mid)
         self.state["layout"] = LAYOUT_VERSION
-        log("[card] re-laid out the leaderboard channel", mirror=True)
+        log("[card] re-laid out the leaderboard and statistics channels",
+            mirror=True)
 
     def sweep(self):
         """Clear out any duplicate cards left behind by an earlier run."""
         self.migrate_layout()
-        for url, key in ((CFG["webhook_main"], "status"),
-                         (CFG["webhook_weekly"], "weekly"),
-                         (CFG["webhook_weekly"], "alltime"),
-                         (CFG["webhook_weekly"], "stats"),
-                         (CFG["webhook_perf"], "perf")):
-            if url and not DRY_RUN:
+        if DRY_RUN:
+            return
+        # Sweep every card the bot has ever recorded, not a fixed list: the
+        # statistic channel's cards are named dynamically, and leaving them out
+        # meant their orphans were never collected.
+        for key in list(self.state.get("msg_stale", {})):
+            url = webhook_for(key)
+            if url:
                 sweep_stale(url, key, self.state)
 
     def replay(self):
@@ -1244,8 +1294,9 @@ class Bot:
         upsert_embed(url, "stat_overview", state,
                      gamestats.overview_embed(self.criteria, self.criterion_values,
                                               len(self.criterion_values)))
-        for key, embed in gamestats.category_embeds(self.criteria,
-                                                    self.criterion_values):
+        for key, embed in gamestats.category_embeds(
+                self.criteria, self.criterion_values,
+                curated=self.curated, top=CFG["stats_top_per_category"]):
             wanted.append(f"stat_{key}")
             # Space the updates out: a webhook allows roughly five requests
             # every two seconds, and this is a whole channel of cards at once.
@@ -1267,7 +1318,7 @@ class Bot:
         if now - self.last_stats >= CFG["stats_seconds"]:
             self.last_stats = now
             self.stats = load_stats()
-            self.criterion_values = criterion_values(self.stats, self.criteria)
+            self.refresh_criteria()
             self.check_milestones(all_playtimes(self.stats, self.state, now))
         if (CFG["external_check"] and CFG["public_address"]
                 and now - self.last_external >= CFG["external_check_minutes"] * 60):
@@ -1296,7 +1347,7 @@ class Bot:
         now = time.time()
         self.do_ping(now)
         self.stats = load_stats()
-        self.criterion_values = criterion_values(self.stats, self.criteria)
+        self.refresh_criteria()
         self.check_milestones(all_playtimes(self.stats, self.state, now))
         if self.perf:
             # CPU percentages and I/O rates are deltas between readings, so a
@@ -1319,7 +1370,7 @@ class Bot:
         self.reader.seek_end()
         self.do_ping(time.time())
         self.stats = load_stats()
-        self.criterion_values = criterion_values(self.stats, self.criteria)
+        self.refresh_criteria()
         self.check_milestones(all_playtimes(self.stats, self.state, time.time()))
         self.dirty = True
         while True:

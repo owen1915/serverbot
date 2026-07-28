@@ -22,6 +22,9 @@
   "alert_heap_pct": 92,
   "daily_report": true,
 
+  "stats_card_seconds": 900,
+  "stats_top_per_category": 0,
+
   "main_events": false,
   "relay_chat": false,
   "announce_deaths": true,

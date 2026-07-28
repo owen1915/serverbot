@@ -56,16 +56,23 @@ in the performance channel either way.
 - 🏆 **Weekly Playtime** — resets Monday, with 🏁 **Final Standings** posted permanently
 - 📈 **This Week's Statistics** — only what has moved since the week began
 
-**Statistics channel** (`webhook_stats`) — every statistic the server tracks, all-time.
+**Statistics channel** (`webhook_stats`) — every statistic the server records, all-time.
+Currently **2,292** of them, across 41 cards.
 
-The Vanilla Tweaks statistic datapacks declare a scoreboard objective per statistic,
-each bound to a vanilla criterion. Those criteria are read straight out of the datapack
-zips in `world/datapacks`, so this follows whatever is installed — add or remove a pack
-and the cards follow, with no list to maintain. Currently **216** distinct statistics.
+Minecraft writes every statistic to `world/players/stats/*.json` on its own, whether or
+not a datapack declares a scoreboard objective for it, and it stores only non-zero
+entries. So the set worth showing is simply the union across players — no scoreboard, no
+NBT, and nothing to enable. A statistic datapack is *not* what makes a statistic get
+recorded; it only puts one on an in-game scoreboard.
 
-One card per category (General, Blocks Mined, Mobs Killed, Killed By, Items Used, Tools
-Broken, Items Crafted), each an aligned table inside a Discord ANSI code block, which is
-the only way to get columns that line up in a message:
+The Vanilla Tweaks packs in `world/datapacks` are still read, for a different purpose:
+their objectives are a curated goal list, so each card can name the goals nobody has met
+yet ("Warden, Elder Guardian…"). Read from the save alone, the unscored set would be
+every item in the game, which is not worth printing.
+
+One card per category — General, Blocks Mined, Mobs Killed, Killed By, Items Used, Items
+Crafted, Tools Broken, Items Picked Up, Items Dropped — each an aligned table inside a
+Discord ANSI code block, which is the only way to get columns that line up in a message:
 
 ```
 Mob                    Leader           Kills
@@ -75,10 +82,12 @@ Cow                    owen1915         1,481
 Zombie                 owen1915           912
 ```
 
-Each card lists the statistics nobody has scored yet, so the untouched ones are visible
-rather than merely absent, and a 🏛️ **Hall of Fame** card ranks players by how many
-statistics they lead. Categories too large for one message split across numbered cards
-rather than being silently truncated.
+A 🏛️ **Hall of Fame** card ranks players by how many statistics they lead. Categories
+too large for one message split across numbered cards rather than being silently
+truncated — "Items Picked Up" alone is 595 statistics over 10 cards.
+
+Forty-one cards is a lot of channel. Set `stats_top_per_category` to, say, `40` to keep
+each category to its headline figures instead.
 
 **Performance channel** (`webhook_perf`) — a live 📈 **Performance** card, edited in place
 
@@ -129,6 +138,7 @@ Any setting can also be given as an environment variable: `MCBOT_RELAY_CHAT=1`,
 | `alert_heap_pct` | `92` | warn above this share of the java heap |
 | `daily_report` | `true` | post a summary of the previous day at midnight |
 | `stats_card_seconds` | `900` | how often to redraw the all-time statistic cards |
+| `stats_top_per_category` | `0` | cap rows per category; `0` shows every statistic |
 
 ## Running as a service (Windows)
 
