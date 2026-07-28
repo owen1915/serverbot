@@ -1,9 +1,9 @@
 {
-  "online": true,
+  "online": false,
   "players": [],
   "count": 0,
-  "fail_streak": 1,
-  "status_msg_id": "1531434890560671756",
+  "fail_streak": 2,
+  "status_msg_id": "1531558583144288308",
   "sessions": {},
   "week": "2026-W31",
   "weekly_seconds": {
@@ -11,7 +11,7 @@
     "PowerRubik": 3600
   },
   "weekly_msg_id": "1531366418648662199",
-  "last_poll": 1785212731.5969172,
+  "last_poll": 1785222421.5045016,
   "alltime_msg_id": "1531386213242638460",
   "milestones": {},
   "alltime_seconds": {
