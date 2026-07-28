@@ -1123,7 +1123,10 @@ class Bot:
                     except (urllib.error.URLError, OSError) as e:
                         log(f"[error] daily report post failed: {e}")
 
-        if now - self.last_perf_card >= CFG["perf_card_seconds"]:
+        # Wait for a second sample: rates and sparklines are differences
+        # between readings, so a card drawn from one reading looks empty.
+        if (now - self.last_perf_card >= CFG["perf_card_seconds"]
+                and len(self.perf.history) >= 2):
             self.last_perf_card = now
             address = CFG["public_address"] or f"{CFG['host']}:{CFG['port']}"
             upsert_embed(CFG["webhook_perf"], "perf", self.state,
