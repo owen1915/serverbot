@@ -1888,7 +1888,9 @@ class Bot:
         agg = funstats.aggregate(self.criteria, self.criterion_values)
         index = self.fun.get("tab_index", 0) % len(self.TAB_STATS)
         self.fun["tab_index"] = index + 1
-        self.fun["tab_current"] = index
+        # Remember the stat by name, not by position: editing the list must
+        # never make a joiner's row disagree with everybody else's.
+        self.fun["tab_current"] = self.TAB_STATS[index][0]
         cmds = ["scoreboard objectives add mcbot_tab dummy"]
         for name in online:
             cmds += self._tab_row_cmds(agg, name, index)
@@ -1896,9 +1898,17 @@ class Bot:
         if rcon.commands(CFG["server_dir"], cmds) is not None:
             log(f"[tab] now showing {self.TAB_STATS[index][0]}")
 
+    def _tab_current_index(self):
+        """Where the currently-displayed stat sits in the list, or None."""
+        label = self.fun.get("tab_current")
+        for i, entry in enumerate(self.TAB_STATS):
+            if entry[0] == label:
+                return i
+        return None
+
     def refresh_tab_now(self, online):
         """Redraw the currently-shown tab statistic without advancing it."""
-        index = self.fun.get("tab_current")
+        index = self._tab_current_index()
         if index is None or not online:
             return
         agg = funstats.aggregate(self.criteria, self.criterion_values)
@@ -1915,7 +1925,7 @@ class Bot:
         """
         if not CFG["tab_stats"] or DRY_RUN:
             return
-        index = self.fun.get("tab_current")
+        index = self._tab_current_index()
         if index is None:
             return
         agg = funstats.aggregate(self.criteria, self.criterion_values)
@@ -2580,9 +2590,7 @@ class Bot:
             self.check_fun(now)
             # A session clock frozen at its last rotation would be wrong most
             # of the time — while it is the stat on display, keep it ticking.
-            current = self.fun.get("tab_current")
-            if (current is not None and self.state["players"]
-                    and self.TAB_STATS[current % len(self.TAB_STATS)][0] == "online"):
+            if self.fun.get("tab_current") == "online" and self.state["players"]:
                 self.refresh_tab_now(list(self.state["players"]))
         self.maybe_fun_fact(now)
         if (CFG["external_check"] and CFG["public_address"]
