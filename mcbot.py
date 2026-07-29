@@ -1837,10 +1837,6 @@ class Bot:
     # lifetime aggregate; callables read anything else.
     TAB_STATS = [
         ("blocks mined", "mined", "{:,.0f}", "aqua"),
-        ("online",
-         lambda self, agg, name: time.time()
-         - self.state["players"].get(name, time.time()),
-         fmt_duration, "white"),
         ("deaths", "deaths", "{:,.0f}", "red"),
         ("hours played",
          lambda self, agg, name: self.stats.get(name, {}).get("play_time", 0) / 3600,
@@ -1861,20 +1857,27 @@ class Bot:
     ]
 
     def _tab_row_cmds(self, agg, name, index):
-        """The two commands that write one player's labelled tab entry."""
+        """The two commands that write one player's labelled tab entry.
+
+        The row leads with how long they have been on this session, then the
+        rotating statistic: "1h 24m · 8,412 blocks mined".
+        """
         label, source, fmt, color = self.TAB_STATS[index % len(self.TAB_STATS)]
         if callable(source):
             value = source(self, agg, name)
         else:
             value = agg.get(name, {}).get(source, 0)
         shown = fmt(value) if callable(fmt) else fmt.format(value)
-        component = json.dumps([
-            {"text": shown + " ", "color": color, "bold": True},
-            {"text": label, "color": "gray"},
-        ])
+        parts = []
+        start = self.state["players"].get(name)
+        if start is not None:
+            parts += [{"text": fmt_duration(time.time() - start), "color": "white"},
+                      {"text": "  ·  ", "color": "dark_gray"}]
+        parts += [{"text": shown + " ", "color": color, "bold": True},
+                  {"text": label, "color": "gray"}]
         return [f"scoreboard players set {name} mcbot_tab {int(value)}",
                 f"scoreboard players display numberformat {name} "
-                f"mcbot_tab fixed {component}"]
+                f"mcbot_tab fixed {json.dumps(parts)}"]
 
     def rotate_tab(self, online):
         """Show the next statistic in the tab list, labelled on every row.
@@ -2363,6 +2366,7 @@ class Bot:
         if rolled or now - self.last_motd >= CFG["motd_refresh_seconds"]:
             self.last_motd = now
             self.refresh_motd(now)
+            self.update_tab_style(now)
 
     def refresh_stat_cards(self):
         """The all-time statistic channel: an overview plus one card a category."""
@@ -2409,6 +2413,71 @@ class Bot:
                     continue
         return None
 
+    def server_name(self):
+        """The server's display name, from server.properties, codes stripped."""
+        try:
+            with open(os.path.join(CFG["server_dir"], "server.properties"),
+                      encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("motd="):
+                        stripped = MOTD_CODE_RE.sub("", line[5:].strip())
+                        if stripped:
+                            return stripped
+                        break
+        except OSError:
+            pass
+        return "Minecraft Server"
+
+    def update_tab_style(self, now):
+        """Keep Styled Player List's header naming the server and the day.
+
+        The style file is rewritten whenever the day number changes and the
+        mod is asked to reload; header and footer live in the mod, while the
+        per-row statistics stay on the scoreboard.
+        """
+        if DRY_RUN:
+            return
+        path = os.path.join(CFG["server_dir"], "config", "styledplayerlist",
+                            "styles", "default.json")
+        if not os.path.isfile(path):
+            return
+        today = day_key(now)
+        if self.fun.get("tab_style_day") == today:
+            return
+        start = self.world_start()
+        day_number = (dt.date.fromtimestamp(now) - start).days if start else "?"
+        style = {
+            "style_name": "BigBoys",
+            "update_tick_time": 20,
+            "list_header": [
+                "",
+                f"<gr #55ff88 #ffd75f><bold> {self.server_name()} </bold></gr>"
+                f"<gray>| <white>Day {day_number}</white> ",
+                f"<color #555555>[ </color><color #FF5555>%server:online%"
+                f"<color #666676>/</color>%server:max_players%</color>"
+                f"<color #555555> ]</color>",
+                "",
+            ],
+            "list_footer": [
+                "",
+                "<gray>TPS %server:tps_colored% <dark_gray>|</dark_gray> "
+                "<gray>ping <color:#ffba26>%player:ping%</color> "
+                "<dark_gray>|</dark_gray> <green>owengoodman.com</green>",
+                "",
+            ],
+            "hidden_in_commands": False,
+        }
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(style, f, indent=2)
+        except OSError as e:
+            log(f"[warn] could not write the player-list style: {e}")
+            return
+        delivered = rcon.command(CFG["server_dir"], "styledplayerlist reload")
+        if delivered is not None:
+            self.fun["tab_style_day"] = today
+            log(f"[tab] header set to {self.server_name()} | Day {day_number}")
+
     def motd_pairs(self, now):
         """[(line1, line2)] for the server list: the name and day, then a fact.
 
@@ -2416,18 +2485,8 @@ class Bot:
         entry and every refresh of the server list shows a different one.
         """
         fun = self.fun
-        name = "Minecraft Server"
-        try:
-            with open(os.path.join(CFG["server_dir"], "server.properties"),
-                      encoding="utf-8") as f:
-                for line in f:
-                    if line.startswith("motd="):
-                        stripped = MOTD_CODE_RE.sub("", line[5:].strip())
-                        name = stripped or name
-                        break
-        except OSError:
-            pass
-        title = f"<gradient:#55ff88:#ffd75f><bold>{name}</bold></gradient>"
+        title = (f"<gradient:#55ff88:#ffd75f><bold>{self.server_name()}"
+                 f"</bold></gradient>")
         start = self.world_start()
         if start:
             day_number = (dt.date.fromtimestamp(now) - start).days
@@ -2588,9 +2647,8 @@ class Bot:
             self.refresh_criteria()
             self.check_milestones(all_playtimes(self.stats, self.state, now))
             self.check_fun(now)
-            # A session clock frozen at its last rotation would be wrong most
-            # of the time — while it is the stat on display, keep it ticking.
-            if self.fun.get("tab_current") == "online" and self.state["players"]:
+            # Every row leads with the session clock, so every row must tick.
+            if CFG["tab_stats"] and self.state["players"]:
                 self.refresh_tab_now(list(self.state["players"]))
         self.maybe_fun_fact(now)
         if (CFG["external_check"] and CFG["public_address"]

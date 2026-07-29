@@ -262,10 +262,10 @@ off, so nothing breaks when it isn't available:
   transcript. The schedule persists in state, so restarts do not bunch facts together
 - **Cycling tab list** (`tab_stats`) — on the same beat, the tab list shows the next
   statistic in rotation, labelled on every row via a fixed number format:
-  "owen1915  1,234 blocks mined", each statistic in its own signature color. Eleven
-  cycle: mined, session time ("1h 24m online", refreshed every minute while shown),
-  deaths, hours, mob kills, km travelled, placed, jumps, diamond ore, fish, trades.
-  Players who join mid-cycle are stamped with the current statistic immediately
+  "owen1915  1,234 blocks mined", each statistic in its own signature color. Ten
+  cycle: mined, deaths, hours, mob kills, km travelled, placed, jumps, diamond ore,
+  fish, trades — session time is Styled Player List's job. Players who join
+  mid-cycle are stamped with the current statistic immediately
 - **Welcome whispers** (`welcome_whispers`) — a private tellraw on join: "Welcome
   back, owen1915 — day 6 of your streak, you slipped #2 → #4 in blocks mined while
   you were away." First-timers get a public hello instead. Quick relogs get nothing
