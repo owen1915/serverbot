@@ -2048,6 +2048,14 @@ class Bot:
             earliest[name] = min(earliest.get(name, created), created)
         dates = {n: dt.date.fromtimestamp(t).isoformat()
                  for n, t in earliest.items()}
+        # A date at the very edge of the evidence means "at least this old":
+        # the archive only reaches back so far, and anyone at its floor was
+        # plausibly there from the start. Credit them from the world's
+        # first day rather than from where the records happen to begin.
+        if dates and self.world_start():
+            floor = min(dates.values())
+            dates = {n: (self.world_start().isoformat() if d == floor else d)
+                     for n, d in dates.items()}
         for name, stamp in ledger.first_joins(CFG["server_dir"]).items():
             dates.setdefault(name, stamp)
         dates.update(fun["first_seen"])  # anything already recorded wins
