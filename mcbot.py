@@ -34,6 +34,7 @@ import urllib.request
 import funstats
 import gamestats
 import perf
+import rcon
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(HERE, "config.json")
@@ -98,6 +99,12 @@ DEFAULTS = {
     "down_after_seconds": 90,
     # Relay in-game chat to the main channel.
     "relay_chat": False,
+    # Mirror event announcements (records, streaks, awards…) into the game
+    # itself, via RCON. Does nothing until RCON is enabled on the server.
+    "ingame_events": True,
+    # Keep the MOTD fresh through MiniMOTD's config. Also needs RCON.
+    "dynamic_motd": True,
+    "motd_refresh_seconds": 600,
     # Announce deaths and advancements.
     "announce_deaths": True,
     "announce_advancements": True,
@@ -315,14 +322,18 @@ def events_say(content):
     the whole point of those is that they never notify anybody.
     """
     global _events_warned
+    if DRY_RUN:
+        log(f"[dry-run][events] {content}")
+        return
+    if CFG["ingame_events"]:
+        # The same moment, told to the people it happened to. Silently a
+        # no-op until RCON is enabled on the server.
+        rcon.broadcast(CFG["server_dir"], content)
     if not CFG["webhook_events"]:
         if not _events_warned:
             log("[warn] webhook_events is not set — record, streak and other "
                 "announcements are being dropped")
             _events_warned = True
-        return
-    if DRY_RUN:
-        log(f"[dry-run][events] {content}")
         return
     try:
         discord(CFG["webhook_events"], "POST", {
@@ -927,6 +938,66 @@ def eastern_clock(epoch):
     return time.strftime("%H:%M", time.gmtime(epoch + eastern_offset(epoch)))
 
 
+# ------------------------------------------------------------ dynamic motd --
+
+# The vanilla MOTD is read from server.properties once, at boot. MiniMOTD
+# re-reads its own config on "minimotd reload", so the bot keeps the config's
+# motd list stocked with live facts and asks for a reload over RCON — the
+# server-list entry becomes a tiny dashboard.
+
+
+def find_minimotd_config(server_dir):
+    """MiniMOTD's main.conf, wherever the mod put it, or None until it exists."""
+    config_root = os.path.join(server_dir, "config")
+    try:
+        for name in os.listdir(config_root):
+            if "minimotd" in name.lower():
+                path = os.path.join(config_root, name, "main.conf")
+                if os.path.isfile(path):
+                    return path
+    except OSError:
+        pass
+    return None
+
+
+def replace_motd_block(text, entries_text):
+    """Swap the motd=[...] list in a HOCON config, leaving the rest alone.
+
+    Only the list is touched, so every other setting keeps whatever the
+    admin set it to. Brackets are counted rather than matched by regex —
+    the list nests one level of braces per entry.
+    """
+    start = text.find("motd=[")
+    if start < 0:
+        start = text.find("motd = [")
+    if start < 0:
+        return None
+    open_at = text.index("[", start)
+    depth = 0
+    for i in range(open_at, len(text)):
+        if text[i] == "[":
+            depth += 1
+        elif text[i] == "]":
+            depth -= 1
+            if depth == 0:
+                return text[:start] + "motd=" + entries_text + text[i + 1:]
+    return None
+
+
+def render_motd_entries(pairs):
+    """The HOCON list text for [(line1, line2), ...]."""
+    blocks = []
+    for line1, line2 in pairs:
+        line1 = line1.replace('"', "'")
+        line2 = line2.replace('"', "'")
+        blocks.append("    {\n"
+                      "        icon=random\n"
+                      f"        line1=\"{line1}\"\n"
+                      f"        line2=\"{line2}\"\n"
+                      "    }")
+    return "[\n" + ",\n".join(blocks) + "\n]"
+
+
 # ------------------------------------------------------------- formatting --
 
 def fmt_duration(seconds):
@@ -1183,6 +1254,8 @@ FUN_DEFAULTS = {
     "race": {},               # stat -> current all-time leader
     "race_hot": {},           # "stat:pair" -> when that close race was last called
     "annv": [],               # world anniversaries already announced
+    "mvp": "",                # yesterday's Most Dedicated, for the MOTD
+    "motd_sig": "",           # what the MOTD currently says, to skip rewrites
 }
 
 
@@ -1235,6 +1308,7 @@ class Bot:
         self.last_perf_card = 0.0
         self.last_stat_cards = 0.0
         self.last_daily_cards = 0.0
+        self.last_motd = 0.0
         self.status = None
         # The datapacks' objectives are a curated goal list, used to say which
         # goals are still unmet. What gets *shown* comes from the save itself,
@@ -1565,7 +1639,10 @@ class Bot:
         if now - self.last_perf_sample >= CFG["perf_sample_seconds"]:
             self.last_perf_sample = now
             latency = self.status.get("_latency_ms") if self.status else None
-            self.perf.sample(now, latency, len(self.state["players"]))
+            # The server's own tick cost, if RCON will answer. Skipped while
+            # the ping says the server is down — no point knocking.
+            tick = rcon.query_tick(CFG["server_dir"]) if self.status else None
+            self.perf.sample(now, latency, len(self.state["players"]), tick=tick)
             if CFG["perf_alerts"]:
                 for message in self.perf.check_alerts(now, {
                     "host_cpu": CFG["alert_host_cpu"],
@@ -1712,6 +1789,9 @@ class Bot:
                 agg[name]["playtime"] = played.get(name, 0)
                 agg[name]["chat"] = fun["chat_today"].get(name, 0)
 
+            awards = funstats.compute_awards(agg, state["day"])
+            fun["mvp"] = next((winner for _, title, winner, _, _ in awards
+                               if title == "Most Dedicated"), "")
             # The recap bundle: one post, one notification at most.
             recap = [
                 daily_playtime_embed(state, playtimes, now, final=True),
@@ -1721,8 +1801,7 @@ class Bot:
                     0xE67E22, "the day that just ended  •  resets at 3:00 am Eastern",
                     CFG["stats_noise_scale"],
                     empty="nothing was recorded yesterday"),
-                funstats.awards_embed(funstats.compute_awards(agg, state["day"]),
-                                      label),
+                funstats.awards_embed(awards, label),
                 funstats.challenge_result_embed(
                     funstats.pick_challenge(state["day"]), agg, label),
             ]
@@ -1882,6 +1961,9 @@ class Bot:
             self.last_daily_cards = now
             self.refresh_daily_cards(now)
             save_state(state)
+        if rolled or now - self.last_motd >= CFG["motd_refresh_seconds"]:
+            self.last_motd = now
+            self.refresh_motd(now)
 
     def refresh_stat_cards(self):
         """The all-time statistic channel: an overview plus one card a category."""
@@ -1917,6 +1999,96 @@ class Bot:
             time.sleep(0.4)
             upsert_embed(url, f"stat_{key}", state, embed)
         self.drop_unused_cards(url, "stat_", wanted)
+
+    def motd_pairs(self, now):
+        """[(line1, line2)] for the server list — the facts worth advertising.
+
+        MiniMOTD picks one entry at random per ping, so each fact is its own
+        entry and every refresh of the server list shows a different one.
+        """
+        fun = self.fun
+        name = "Minecraft Server"
+        try:
+            with open(os.path.join(CFG["server_dir"], "server.properties"),
+                      encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("motd="):
+                        stripped = MOTD_CODE_RE.sub("", line[5:].strip())
+                        name = stripped or name
+                        break
+        except OSError:
+            pass
+        title = f"<gradient:#55ff88:#ffd75f><bold>{name}</bold></gradient>"
+
+        facts = []
+        if self.state["day"]:
+            _, challenge, _, _ = funstats.pick_challenge(self.state["day"])
+            facts.append(f"<yellow>today's challenge: <white>{challenge.lower()}")
+        if fun["last_death"] and now - max(fun["last_death"].values()) >= 86400:
+            quiet = int((now - max(fun["last_death"].values())) // 86400)
+            facts.append(f"<green>{quiet} day{'s' if quiet != 1 else ''} death-free")
+        else:
+            deaths = sum(e.get("deaths", 0) for e in self.stats.values())
+            if deaths:
+                facts.append(f"<red>{deaths:,} deaths <gray>and counting")
+        if fun["world_first_day"]:
+            age = (dt.date.fromtimestamp(now)
+                   - dt.date.fromisoformat(fun["world_first_day"])).days
+            facts.append(f"<gray>day <white>{age}</white> of the adventure")
+        running = [(n, e["current"]) for n, e in fun["streaks"].items()
+                   if e["current"] >= 2]
+        if running:
+            top, days = max(running, key=lambda kv: kv[1])
+            facts.append(f"<light_purple>{top} is on a {days}-day streak")
+        if fun["mvp"]:
+            facts.append(f"<gold>yesterday's MVP: {fun['mvp']}")
+        hours = sum(e.get("play_time", 0) for e in self.stats.values()) / 3600
+        if hours >= 1:
+            facts.append(f"<green>{hours:,.0f} hours <gray>played together")
+        for key, _, label, _, _, unit in funstats.RECORDS:
+            entry = fun["records"].get(key)
+            if entry:
+                facts.append(f"<aqua>{label.lower()} in a day: "
+                             f"{funstats.fmt_value(unit, entry['value'])} "
+                             f"<gray>({entry['holder']})")
+        if not facts:
+            facts = ["<gray>a fine day for block games"]
+        return [(title, fact) for fact in facts[:8]]
+
+    def refresh_motd(self, now):
+        """Restock MiniMOTD's rotation and ask the server to re-read it.
+
+        Quietly does nothing until the mod's config exists; a reload that
+        cannot be delivered (RCON off) still leaves the file ready for the
+        server's next boot.
+        """
+        if not CFG["dynamic_motd"] or DRY_RUN:
+            return
+        path = find_minimotd_config(CFG["server_dir"])
+        if not path:
+            return
+        pairs = self.motd_pairs(now)
+        signature = json.dumps(pairs)
+        if signature == self.fun["motd_sig"]:
+            return
+        try:
+            with open(path, encoding="utf-8") as f:
+                text = f.read()
+            replaced = replace_motd_block(text, render_motd_entries(pairs))
+            if not replaced:
+                log(f"[warn] no motd list found in {path}; leaving it alone")
+                self.fun["motd_sig"] = signature  # do not retry every cycle
+                return
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(replaced)
+        except OSError as e:
+            log(f"[warn] could not update the MOTD config: {e}")
+            return
+        self.fun["motd_sig"] = signature
+        delivered = rcon.command(CFG["server_dir"], "minimotd reload")
+        log(f"[motd] refreshed with {len(pairs)} entries"
+            + ("" if delivered is not None
+               else " (reload pending — RCON unavailable)"))
 
     def refresh_daily_cards(self, now):
         """Today's statistics: the same categories, counted since 03:00 Eastern.
@@ -2028,7 +2200,8 @@ class Bot:
                 self.perf.sample(
                     time.time(),
                     self.status.get("_latency_ms") if self.status else None,
-                    len(self.state["players"]))
+                    len(self.state["players"]),
+                    tick=rcon.query_tick(CFG["server_dir"]) if self.status else None)
             self.do_perf(time.time())
         self.refresh_cards(now, reposition=False)
         self.refresh_stat_cards()

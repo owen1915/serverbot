@@ -238,6 +238,42 @@ one per condition every 30 minutes.
 
 **Log channel** (`webhook_logs`) — the watcher's own significant log lines.
 
+## Talking back: RCON
+
+With `enable-rcon=true` in server.properties the bot can also *ask* the server things
+and *tell* players things. Credentials are read straight out of server.properties — no
+copy in config.json — and every feature below degrades to a silent no-op while RCON is
+off, so nothing breaks when it isn't available:
+
+- **Real tick health** — `/tick query` every performance sample. The performance card
+  gains a `tick` line (ms/tick with a sparkline, true TPS, p95), and the daily report
+  gains the day's average and peak
+- **In-game event mirror** (`ingame_events`) — everything the events channel gets is
+  also told to the players it happened to, via `tellraw`: records broken, streaks, the
+  day's challenge, awards
+- **Dynamic MOTD** (`dynamic_motd`) — see below
+
+## The dynamic MOTD
+
+Vanilla reads `motd` from server.properties once at boot, so a changing MOTD needs the
+MiniMOTD mod. The bot keeps MiniMOTD's `motd` list stocked with live facts — today's
+challenge, days death-free, the world's age, the hottest streak, yesterday's MVP, the
+record book, total hours played together — and asks for `minimotd reload` over RCON.
+MiniMOTD shows a random entry per ping, so the server list becomes a tiny rotating
+dashboard.
+
+Only the `motd=[...]` list inside MiniMOTD's main.conf is rewritten (brackets are
+counted, everything else is preserved), the file is only touched when the facts change,
+and if RCON is unreachable the file still updates for the server's next boot. The base
+server name is taken from server.properties `motd` and dressed in a gradient.
+
+## Server-side mods
+
+The bot needs none of these, but uses them when present: **spark** (installed),
+**MiniMOTD** (dynamic MOTD above), **Ledger** with **Fabric Language Kotlin** (block
+logging to SQLite — reader planned: true placed-block counts, busiest chunk, activity
+by hour).
+
 ## Setup
 
 1. `cp config.example.json config.json` and fill it in. `config.json` holds the webhook

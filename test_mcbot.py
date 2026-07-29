@@ -469,6 +469,50 @@ def test_celebrations():
                               [100], dtm.date(2026, 7, 29)), [])
 
 
+def test_rcon_and_motd():
+    """The RCON packet format, tick parsing, and MOTD config surgery."""
+    import struct
+    import rcon
+
+    packet = rcon._packet(7, rcon.COMMAND, "tick query")
+    (length,) = struct.unpack("<i", packet[:4])
+    check("packet length covers the payload", length, len(packet) - 4)
+    req_id, kind = struct.unpack("<ii", packet[4:12])
+    check("packet carries id and type", (req_id, kind), (7, 2))
+    check("packet body is null-terminated twice", packet[-2:], b"\x00\x00")
+
+    tick = rcon.parse_tick(
+        "The game is running normally.\n"
+        "Target tick rate: 20.0 per second.\n"
+        "Average time per tick: 4.2ms (Target: 50.0ms)\n"
+        "Percentiles: P50: 3.9ms P95: 8.1ms P99: 12.0ms")
+    check("mspt parsed", tick["mspt"], 4.2)
+    check("p95 parsed", tick["p95"], 8.1)
+    check("healthy server reports the target rate", tick["tps"], 20.0)
+    lagging = rcon.parse_tick("Target tick rate: 20.0 per second.\n"
+                              "Average time per tick: 100.0ms")
+    check("a lagging server reports real TPS", lagging["tps"], 10.0)
+    check("garbage parses to None", rcon.parse_tick("Unknown command"), None)
+
+    config = ('modify-player-count=false\nmotd=[\n    {\n        icon=random\n'
+              '        line1="old"\n        line2="old"\n    }\n]\nsome-toggle=true\n')
+    entries = mcbot.render_motd_entries([("<gradient>Name</gradient>", "<gray>fact one"),
+                                         ("<gradient>Name</gradient>", "fact two")])
+    replaced = mcbot.replace_motd_block(config, entries)
+    check("settings around the motd list survive",
+          replaced.startswith("modify-player-count=false\n")
+          and replaced.endswith("some-toggle=true\n"), True)
+    check("the new entries are in", "fact two" in replaced and '"old"' not in replaced,
+          True)
+    check("a config with no motd list is left alone",
+          mcbot.replace_motd_block("nothing here", entries), None)
+
+    stripped = rcon.MARKDOWN_RE.sub("", "🔥  **owen1915** is on a **3-day** streak!")
+    check("markdown is stripped for the in-game mirror",
+          rcon.NON_TEXT_RE.sub("", stripped).strip(),
+          "owen1915 is on a 3-day streak!")
+
+
 def test_chat_transcript():
     """The chat channel repeats everything, whatever the main channel announces."""
     bot = mcbot.Bot.__new__(mcbot.Bot)
@@ -538,6 +582,8 @@ def main():
     test_summary_totals()
     print()
     test_celebrations()
+    print()
+    test_rcon_and_motd()
     print()
     test_chat_transcript()
     print()

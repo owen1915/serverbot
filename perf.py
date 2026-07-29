@@ -221,11 +221,20 @@ class Monitor:
 
     # -- one sample -------------------------------------------------------
 
-    def sample(self, now, ping_ms, players):
-        """Take a reading and fold it into the history and the ledger."""
+    def sample(self, now, ping_ms, players, tick=None):
+        """Take a reading and fold it into the history and the ledger.
+
+        tick is the /tick query result when RCON can supply one — the
+        server's own measure of tick cost, which no amount of pinging from
+        outside can see.
+        """
         self.availability.observe(ping_ms is not None, now)
         point = {"t": now, "ping": ping_ms, "players": players,
                  "up": ping_ms is not None}
+        if tick:
+            point["mspt"] = tick.get("mspt")
+            point["tps"] = tick.get("tps")
+            point["mspt_p95"] = tick.get("p95")
 
         if psutil:
             elapsed = (now - self._last_sample_time) if self._last_sample_time else None
@@ -271,7 +280,8 @@ class Monitor:
         self._accumulate(now, point)
         return point
 
-    ACCUMULATED = ("cpu", "ram_pct", "ping", "players", "java_cpu", "java_rss")
+    ACCUMULATED = ("cpu", "ram_pct", "ping", "players", "java_cpu", "java_rss",
+                   "mspt")
 
     def _accumulate(self, now, point):
         """Fold the sample into today's running totals.
@@ -335,6 +345,9 @@ class Monitor:
             lines.append(f"> `server ` cpu avg **{average('java_cpu'):.0f}%** "
                          f"(peak {peak('java_cpu'):.0f}%)  ·  "
                          f"memory peak {fmt_bytes(peak('java_rss'))}")
+        if average("mspt") is not None:
+            lines.append(f"> `tick   ` avg **{average('mspt'):.1f} ms/t**  ·  "
+                         f"peak {peak('mspt'):.1f} ms/t")
         lines.append(f"> `lag    ` " + (f"**{len(lag)}** tick overrun(s)" if lag
                                         else "**none**"))
         return {
@@ -444,6 +457,12 @@ class Monitor:
             average = _mean(recent) or 0
             lines.append(f"> `ping   ` **{pings[-1]:.0f} ms**  {spark(pings)}  "
                          f"avg {average:.0f} ms · max {max(recent or pings):.0f} ms")
+        mspts = [m for m in self.series("mspt") if m is not None]
+        if mspts:
+            tps = self.latest("tps")
+            p95 = self.latest("mspt_p95")
+            lines.append(f"> `tick   ` **{mspts[-1]:.1f} ms/t**  {spark(mspts)}  "
+                         f"TPS **{tps:.1f}**" + (f" · p95 {p95:.1f} ms" if p95 else ""))
         day_lag = self.lag_since(now - 86400)
         lines.append(f"> `lag    ` " + (
             f"**{len(day_lag)}** tick overrun(s) in 24h "
