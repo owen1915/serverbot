@@ -83,6 +83,7 @@ def test_reader():
 def test_events():
     bot = mcbot.Bot.__new__(mcbot.Bot)
     bot.state = mcbot.new_state()
+    bot.fun = mcbot.fun_state(bot.state)
     bot.stats = {}
     bot.dirty = False
     bot.perf = None
@@ -127,6 +128,7 @@ def test_bedrock_names():
     """Floodgate prefixes Bedrock players with '.', which must not be skipped."""
     bot = mcbot.Bot.__new__(mcbot.Bot)
     bot.state = mcbot.new_state()
+    bot.fun = mcbot.fun_state(bot.state)
     bot.stats = {}
     bot.dirty = False
     bot.perf = None
@@ -162,6 +164,7 @@ def test_lag_parsing():
 
     bot = mcbot.Bot.__new__(mcbot.Bot)
     bot.state = mcbot.new_state()
+    bot.fun = mcbot.fun_state(bot.state)
     bot.stats = {}
     bot.dirty = False
     bot.perf = Recorder()
@@ -367,10 +370,85 @@ def test_summary_totals():
           got.get("Blocks Mined") is not None, True)
 
 
+def test_celebrations():
+    """Awards, records, streaks and challenges — the funstats layer."""
+    import datetime as dtm
+    import funstats
+
+    criteria = ["minecraft.mined:minecraft.stone",
+                "minecraft.killed:minecraft.zombie",
+                "minecraft.custom:minecraft.deaths",
+                "minecraft.custom:minecraft.walk_one_cm"]
+    per_player = {
+        "ann": {"minecraft.mined:minecraft.stone": 900,
+                "minecraft.custom:minecraft.walk_one_cm": 700_000},
+        "bob": {"minecraft.killed:minecraft.zombie": 30,
+                "minecraft.custom:minecraft.deaths": 4},
+    }
+    agg = funstats.aggregate(criteria, per_player)
+    check("aggregation sums a section", agg["ann"]["mined"], 900)
+    check("aggregation reads custom stats", agg["bob"]["deaths"], 4)
+    check("absent statistics aggregate to zero", agg["ann"]["deaths"], 0)
+
+    for name, extra in (("ann", {"playtime": 7200, "chat": 0}),
+                        ("bob", {"playtime": 3600, "chat": 12})):
+        agg[name].update(extra)
+    awards = {title: winner for _, title, winner, _, _ in
+              funstats.compute_awards(agg, "2026-07-29")}
+    check("the miner award goes to the miner", awards.get("Deepest Commitment"), "ann")
+    check("the death award goes to the dier", awards.get("Most Deaths"), "bob")
+    check("chatterbox goes to the talker", awards.get("Chatterbox"), "bob")
+    check("nobody fished, so no fishing award", "Gone Fishin'" in awards, False)
+    check("homebody rewards the one who stayed put", awards.get("Homebody"), "bob")
+    check("awards are deterministic for a day",
+          funstats.compute_awards(agg, "2026-07-29"),
+          funstats.compute_awards(agg, "2026-07-29"))
+
+    ledger = {}
+    check("a first record is set silently",
+          funstats.check_records(ledger, agg, "Jul 28"), [])
+    check("the ledger remembers the holder", ledger["mined"]["holder"], "ann")
+    agg2 = {"bob": dict(agg["bob"], mined=2_000, playtime=8000)}
+    broken = funstats.check_records(ledger, agg2, "Jul 29")
+    check("beating a record is announced",
+          [(b[1], b[2], b[4]) for b in broken
+           if b[1] == "Most blocks mined"],
+          [("Most blocks mined", "bob", "ann")])
+    check("a smaller day does not touch the ledger",
+          funstats.check_records(ledger, {"ann": dict(agg["ann"])}, "Jul 30"), [])
+
+    streaks = {}
+    day1 = dtm.date(2026, 7, 27)
+    funstats.update_streaks(streaks, {"ann": 3600, "bob": 200}, day1)
+    check("ten minutes is required for a streak", "bob" in streaks, False)
+    m, _ = funstats.update_streaks(streaks, {"ann": 3600}, day1 + dtm.timedelta(1))
+    m, _ = funstats.update_streaks(streaks, {"ann": 3600}, day1 + dtm.timedelta(2))
+    check("a three-day streak is a milestone", m, [("ann", 3)])
+    _, b = funstats.update_streaks(streaks, {}, day1 + dtm.timedelta(3))
+    check("a missed day breaks the streak", b, [("ann", 3)])
+    check("the best is remembered", streaks["ann"]["best"], 3)
+
+    c1 = funstats.pick_challenge("2026-07-29")
+    check("the challenge is stable across restarts",
+          c1, funstats.pick_challenge("2026-07-29"))
+    standings = funstats.challenge_standings(("⛏️", "Mine", "mined", "count"), agg2)
+    check("challenge standings rank by the stat", standings[0][0], "bob")
+
+    pace = funstats.pace_lines(
+        {"ann": 90 * 3600},
+        [{"ann": 7200}, {"ann": 7200}, {"ann": 7200}],
+        [10, 100, 250], dtm.date(2026, 7, 29))
+    check("pace projects the next milestone", "100h" in pace[0], True)
+    check("pace needs history, not a lifetime average",
+          funstats.pace_lines({"ann": 90 * 3600}, [{"ann": 7200}],
+                              [100], dtm.date(2026, 7, 29)), [])
+
+
 def test_chat_transcript():
     """The chat channel repeats everything, whatever the main channel announces."""
     bot = mcbot.Bot.__new__(mcbot.Bot)
     bot.state = mcbot.new_state()
+    bot.fun = mcbot.fun_state(bot.state)
     bot.stats = {}
     bot.dirty = False
     bot.perf = None
@@ -431,6 +509,8 @@ def main():
     test_noise_floor()
     print()
     test_summary_totals()
+    print()
+    test_celebrations()
     print()
     test_chat_transcript()
     print()

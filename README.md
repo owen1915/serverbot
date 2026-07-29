@@ -128,16 +128,66 @@ day it felt like it belonged to.
   trades, nights slept, raids won — plus who leads the most of today's statistics
 - 📅 **Today's Playtime** — who has played today, seeded from the log archive when the
   watcher starts partway through a day
-- one card per category that has actually moved — empty categories get no card at all,
-  and the channel is laid out again whenever the set changes so it stays in order
+- 🎯 **Today's Challenge** — live standings for the day's competition
+- one card per category, counted since 03:00
 
 Every statistic is tracked daily, not a subset: on a normal day here around **840** of
 them clear the noise floor. The tables show the top ten of each category, so the glance
 card is where the breadth lives — its totals are sums, so they ignore the floor entirely.
 Raise `daily_top_per_category` for longer tables.
 
-At the reset the day's totals are posted permanently as 🌅 **Yesterday's Playtime** and
-🌙 **Yesterday's Statistics**, then the live cards start over from zero.
+This channel never notifies: every card is edited in place, never deleted or re-posted,
+and a category with nothing yet says so on its card rather than disappearing — which is
+what keeps the set of messages stable. The day's recap (🌅 **Yesterday's Playtime**,
+🌙 **Yesterday's Statistics**, 🎖️ **Daily Awards**, 🏁 the challenge result) goes to the
+events channel as one post; without an events webhook it falls back to this channel.
+
+**Events channel** (`webhook_events`) — the hype feed. Everything that is a *moment*
+rather than a standing card lands here:
+
+- 🎖️ the nightly recap bundle: yesterday's playtime and statistics, the **Daily
+  Awards** (Most Dedicated, Menace to Wildlife, Butterfingers, Homebody, Punching Bag,
+  Chatterbox…— each with a minimum so nobody wins an empty category, and flavor text
+  that is deterministic on the date so a restart never re-rolls it), and the challenge
+  result
+- 🎯 the new **challenge of the day** (mine the most, travel the furthest, catch the
+  most fish… — picked deterministically from the date)
+- 📜 **daily records broken** — "new best for blocks mined in a day", with the previous
+  holder named
+- 🔥 **streak milestones** (3, 5, 7, 14… consecutive days) and 💔 broken streaks
+- 🏁 **overtakes** — the #1 spot changing hands in all-time playtime, blocks mined, mob
+  kills or advancements — and "the race is on" when #2 closes within 3%
+- 💎 **diamond finds** (near-time — stats files save every few minutes)
+- 🌟 **rare advancements** (How Did We Get Here?, Cover Me in Debris, …)
+- 🎂 **world birthdays** (day 100, 250, 500, 750, and every full year)
+
+Announcement state is seeded silently on first run, so switching the feature on does not
+replay history as news. Without `webhook_events` these are dropped (logged once); the
+other channels stay silent by design, so nothing is rerouted into them.
+
+**Leaderboard channel additions** — four more edited-in-place cards:
+
+- 📜 **Single-Day Records** — the all-time ledger of daily bests
+- 🔥 **Playtime Streaks** — current runs (10+ minutes counts) and the longest ever
+- 🕐 **Prime Time** — a 24-hour histogram of player-hours by clock hour, seeded from the
+  whole log archive and accumulated live from then on
+- 🗣️ **Chat Leaders** — lifetime message counts, also archive-seeded
+
+The 👑 All-Time Hours card also gains ▲▼ movement arrows against yesterday's ranking and
+an "On pace" section projecting who reaches their next playtime milestone when (needs a
+few days of history before it will say anything).
+
+**Statistics channel additions** —
+
+- 🌟 **Player Spotlight** — a different player each day: favorite block, nemesis, most
+  hunted mob, distance, trades
+- 🗺️ **Advancement Race** — progress toward everything the server has discovered (the
+  full vanilla list lives inside the server jar, so the honest denominator is the union
+  of what anybody here has completed), plus the advancements only one player has
+
+**Transcript flavor** — deaths in the chat channel now carry an obituary ("death #47,
+first in 4d 3h"), and the status card footer shows "☠️ 3d death-free" when the server
+has gone a day or more without one.
 
 The 3:00 am boundary follows US Eastern including daylight saving. `zoneinfo` needs the
 separate `tzdata` package, which a stock Windows Python does not have, so the rule is

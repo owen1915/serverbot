@@ -31,6 +31,7 @@ import time
 import urllib.error
 import urllib.request
 
+import funstats
 import gamestats
 import perf
 
@@ -42,11 +43,23 @@ LOG_FILE = os.path.join(HERE, "mcbot.log")
 USER_AGENT = "mcbot/2.0 (local server watcher)"
 # Bumped when the set of cards in a channel changes, so the old ones are
 # cleared out and the new set is posted in the intended order.
-LAYOUT_VERSION = 4
+LAYOUT_VERSION = 5
 TICKS_PER_SECOND = 20
 
 # All-time playtime marks that earn a shout-out, in hours.
 MILESTONE_HOURS = [10, 25, 50, 100, 250, 500, 1000, 2000]
+
+# Advancements hard enough that earning one is an event in itself. These are
+# the display names as the server logs them.
+RARE_ADVANCEMENTS = {
+    "How Did We Get Here?", "Cover Me in Debris", "Beaconator",
+    "A Complete Catalogue", "Two by Two", "Uneasy Alliance", "Arbalistic",
+    "The End... Again...", "Monsters Hunted", "A Balanced Diet",
+    "Smithing with Style", "Sniper Duel", "Bullseye",
+}
+
+# World ages worth a birthday message, in days, besides every full year.
+ANNIVERSARY_DAYS = {100, 250, 500, 750}
 
 # ------------------------------------------------------------------ config --
 
@@ -71,6 +84,8 @@ DEFAULTS = {
     "webhook_stats": "",    # every tracked statistic, all-time, by category
     "webhook_daily": "",    # today's statistics, reset at 03:00 Eastern
     "webhook_chat": "",     # every chat line, join, leave, death, advancement
+    "webhook_events": "",   # the hype feed: records, streaks, overtakes,
+                            # diamond finds, rare advancements, daily awards
     # Post join/leave/death/advancement/record/up-down messages to the main
     # channel. Off by default: that channel holds the status card and nothing
     # else, so the card stays put and never has to be re-posted.
@@ -288,6 +303,38 @@ def flush_chat():
             return
 
 
+_events_warned = False
+
+
+def events_say(content):
+    """Post to the events channel — records, streaks, overtakes, finds.
+
+    These are moments, not cards: they only make sense as a feed. With no
+    events webhook configured they are dropped, not rerouted — every other
+    channel is either a transcript or a set of silently-edited cards, and
+    the whole point of those is that they never notify anybody.
+    """
+    global _events_warned
+    if not CFG["webhook_events"]:
+        if not _events_warned:
+            log("[warn] webhook_events is not set — record, streak and other "
+                "announcements are being dropped")
+            _events_warned = True
+        return
+    if DRY_RUN:
+        log(f"[dry-run][events] {content}")
+        return
+    try:
+        discord(CFG["webhook_events"], "POST", {
+            "content": content,
+            "username": "MC Events",
+            "allowed_mentions": {"parse": []},
+        })
+        log(f"[events] {content}", mirror=True)
+    except (urllib.error.URLError, OSError) as e:
+        log(f"[error] could not post to the events channel: {e}")
+
+
 def perf_say(content):
     """Post to the performance channel. Never pings anybody."""
     if not CFG["webhook_perf"]:
@@ -318,6 +365,10 @@ def webhook_for(card):
         "weekly": CFG["webhook_weekly"],
         "alltime": CFG["webhook_weekly"],
         "weekstats": CFG["webhook_weekly"],
+        "records": CFG["webhook_weekly"],
+        "streaks": CFG["webhook_weekly"],
+        "primetime": CFG["webhook_weekly"],
+        "chatstats": CFG["webhook_weekly"],
         "stats": CFG["webhook_weekly"],  # retired card, kept so it can be swept
     }.get(card, "")
 
@@ -571,6 +622,22 @@ def count_advancements(uuid):
         if isinstance(val, dict) and val.get("done"):
             n += 1
     return n
+
+
+def load_advancement_sets(stats):
+    """{name: set of completed advancement keys}, recipe unlocks excluded."""
+    out = {}
+    for name, entry in stats.items():
+        path = os.path.join(ADVANCEMENTS_DIR, f"{entry['uuid']}.json")
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+        out[name] = {key for key, val in data.items()
+                     if key != "DataVersion" and "recipes/" not in key
+                     and isinstance(val, dict) and val.get("done")}
+    return out
 
 
 def live_playtime(stats, state, name, now):
@@ -944,6 +1011,12 @@ def status_embed(state, status, stats, now):
         details.append(f"up {fmt_duration(now - state['server_start'])}")
     if status.get("_latency_ms") is not None:
         details.append(f"{status['_latency_ms']} ms")
+    last_deaths = state.get("fun", {}).get("last_death", {})
+    if last_deaths:
+        # The factory-floor safety sign, but for creepers.
+        quiet = now - max(last_deaths.values())
+        if quiet >= 86400:
+            details.append(f"☠️ {int(quiet // 86400)}d death-free")
     if CFG["external_check"] and state.get("external_ok") is False:
         details.append("⚠️ unreachable from the internet")
 
@@ -1033,12 +1106,27 @@ def daily_overview_embed(state, criteria, deltas, playtimes, now):
     }
 
 
-def alltime_embed(playtimes):
+def alltime_embed(playtimes, prev_ranks=None, pace=()):
+    """Lifetime hours, with movement arrows against yesterday's ranking."""
+    ranked = sorted((kv for kv in playtimes.items() if kv[1]),
+                    key=lambda kv: -kv[1])
+    lines = []
+    for i, (name, seconds) in enumerate(ranked[:20]):
+        badge = MEDALS[i] if i < 3 else f"`{i + 1}.`"
+        arrow = ""
+        if prev_ranks and prev_ranks.get(name) not in (None, i + 1):
+            moved = prev_ranks[name] - (i + 1)
+            arrow = f"  ·  {'▲' if moved > 0 else '▼'}{abs(moved)}"
+        lines.append(f"> {badge}  **{name}** — {fmt_duration(seconds)}{arrow}")
+    body = "\n".join(lines) if lines else "> 💤  *nothing recorded yet*"
+    if pace:
+        body += "\n\n**On pace**\n" + "\n".join(pace)
     return {
         "title": "👑  All-Time Hours",
-        "description": rank_lines(list(playtimes.items()), fmt_duration, limit=20),
+        "description": body,
         "color": 0x9B59B6,
-        "footer": {"text": "lifetime totals, straight from the world save"},
+        "footer": {"text": "lifetime totals, straight from the world save"
+                           "  •  arrows vs yesterday"},
         "timestamp": now_iso(),
     }
 
@@ -1067,7 +1155,34 @@ def new_state():
         "external_ok": None,
         "down_since": None,
         "perf": {},                # performance history and the uptime ledger
+        "fun": {},                 # awards, records, streaks, races, chat counts
     }
+
+
+FUN_DEFAULTS = {
+    "seeded": False,          # the one-time log-archive replay has run
+    "world_first_day": "",    # oldest date in the log archive
+    "hours": [0.0] * 24,      # player-seconds by local clock hour
+    "chat_total": {},         # name -> lifetime chat messages
+    "chat_today": {},         # name -> messages since the 03:00 reset
+    "records": {},            # single-day record ledger
+    "streaks": {},            # name -> {current, best, last}
+    "history": [],            # last 30 days of {day, played, chat}
+    "ranks": {},              # yesterday's all-time playtime ranks, for arrows
+    "last_death": {},         # name -> epoch of their latest death
+    "diamond_base": {},       # name -> diamond ore mined, for find announcements
+    "race": {},               # stat -> current all-time leader
+    "race_hot": {},           # "stat:pair" -> when that close race was last called
+    "annv": [],               # world anniversaries already announced
+}
+
+
+def fun_state(state):
+    fun = state.setdefault("fun", {})
+    for key, default in FUN_DEFAULTS.items():
+        fun.setdefault(key, default if not isinstance(default, (dict, list))
+                       else type(default)(default))
+    return fun
 
 
 def load_state():
@@ -1097,8 +1212,10 @@ def save_state(state):
 class Bot:
     def __init__(self):
         self.state = load_state()
+        self.fun = fun_state(self.state)
         self.reader = LogReader(LOG_PATH)
         self.stats = {}
+        self.last_loop = time.time()   # for the prime-time hour buckets
         self.dirty = False          # an event happened: refresh cards, reposition
         self.last_ping = 0.0
         self.last_stats = 0.0
@@ -1160,7 +1277,8 @@ class Bot:
         """
         if self.state.get("layout") == LAYOUT_VERSION or DRY_RUN:
             return
-        for key in ("weekly", "alltime", "stats", "weekstats"):
+        for key in ("weekly", "alltime", "stats", "weekstats",
+                    "records", "streaks", "primetime", "chatstats"):
             mid = self.state["msg"].pop(key, None)
             if mid and CFG["webhook_weekly"]:
                 _delete_message(CFG["webhook_weekly"], mid)
@@ -1218,6 +1336,58 @@ class Bot:
                 - (time.time() - state["players"][name]))
         log(f"[replay] {len(state['players'])} online: "
             f"{', '.join(sorted(state['players'])) or '(nobody)'}")
+
+    def seed_engagement(self):
+        """One archive replay to backfill what the live loop tracks from now on.
+
+        The prime-time buckets, the chat counts and the world's first day all
+        have history sitting in the log archive; without this pass they would
+        all start from zero and take weeks to become interesting.
+        """
+        fun = self.fun
+        if fun["seeded"]:
+            return
+        events = read_all_logs()
+        sessions = {}
+
+        def credit(start, end):
+            # Split a session across the clock hours it touched.
+            moment = start
+            while moment < end:
+                boundary = (moment // 3600 + 1) * 3600
+                chunk = min(boundary, end) - moment
+                fun["hours"][time.localtime(moment).tm_hour] += chunk
+                moment += chunk
+
+        for when, msg in events:
+            if START_RE.match(msg) or STOP_RE.match(msg):
+                for start in sessions.values():
+                    credit(start, when)
+                sessions.clear()
+                continue
+            m = JOIN_RE.match(msg)
+            if m:
+                sessions[m.group(1)] = when
+                continue
+            m = LEAVE_RE.match(msg)
+            if m:
+                start = sessions.pop(m.group(1), None)
+                if start is not None:
+                    credit(start, when)
+                continue
+            m = CHAT_RE.match(msg)
+            if m:
+                name = m.group(1)
+                fun["chat_total"][name] = fun["chat_total"].get(name, 0) + 1
+        if events:
+            fun["world_first_day"] = dt.date.fromtimestamp(events[0][0]).isoformat()
+        else:
+            fun["world_first_day"] = stat_day(time.time()).isoformat()
+        fun["seeded"] = True
+        log(f"[fun] seeded from the archive: "
+            f"{sum(fun['hours']) / 3600:,.0f} player-hours, "
+            f"{sum(fun['chat_total'].values()):,} chat messages, "
+            f"world began {fun['world_first_day']}")
 
     def handle(self, msg, now):
         state = self.state
@@ -1282,6 +1452,9 @@ class Bot:
         if m:
             name, adv = m.group(1), m.group(2)
             chat_say(f"🏅  **{name}** earned the advancement **[{adv}]**")
+            if adv in RARE_ADVANCEMENTS:
+                events_say(f"🌟  **{name}** just earned **[{adv}]** — "
+                           f"one of the hardest advancements in the game!")
             if CFG["announce_advancements"] and name in state["players"]:
                 say(f":medal: **{name}** earned the advancement **[{adv}]**")
                 self.dirty = True
@@ -1289,9 +1462,12 @@ class Bot:
 
         m = CHAT_RE.match(msg)
         if m:
-            chat_say(f"💬  **{m.group(1)}**: {m.group(2)[:1500]}")
+            name = m.group(1)
+            self.fun["chat_total"][name] = self.fun["chat_total"].get(name, 0) + 1
+            self.fun["chat_today"][name] = self.fun["chat_today"].get(name, 0) + 1
+            chat_say(f"💬  **{name}**: {m.group(2)[:1500]}")
             if CFG["relay_chat"]:
-                say(f"💬  **{m.group(1)}**: {m.group(2)[:1500]}")
+                say(f"💬  **{name}**: {m.group(2)[:1500]}")
             return
 
         # Anything else that starts with the name of somebody currently online
@@ -1299,7 +1475,17 @@ class Bot:
         first = msg.split(" ", 1)[0]
         if (first in state["players"] and not NOT_DEATH_RE.match(msg)
                 and len(msg) > len(first) + 1):
-            chat_say(f"💀  {msg}")
+            # The obituary: their death count, and how long they lasted.
+            last = self.fun["last_death"].get(first)
+            self.fun["last_death"][first] = now
+            context = []
+            deaths = self.stats.get(first, {}).get("deaths", 0)
+            if deaths:
+                context.append(f"death #{deaths + 1}")
+            if last:
+                context.append(f"first in {fmt_duration(now - last)}")
+            suffix = f"  ·  *{', '.join(context)}*" if context else ""
+            chat_say(f"💀  {msg}{suffix}")
             if CFG["announce_deaths"]:
                 say(f":skull: {msg}")
                 self.dirty = True
@@ -1436,33 +1622,143 @@ class Bot:
         state["msg"].pop("weekly", None)
         return True
 
+    DIAMOND_CRITERIA = ("minecraft.mined:minecraft.diamond_ore",
+                        "minecraft.mined:minecraft.deepslate_diamond_ore")
+    # The races worth narrating: name -> how to read each player's number.
+    RACE_STATS = [
+        ("all-time playtime", "playtime", fmt_duration),
+        ("all-time blocks mined", "mined", fmt_number),
+        ("all-time mob kills", "killed", fmt_number),
+        ("advancements", "advancements", fmt_number),
+    ]
+
+    def check_fun(self, now):
+        """Diamond finds and lead changes — checked after every stats refresh."""
+        fun = self.fun
+
+        # Diamond watch. Stats files only save every few minutes, so this is
+        # near-time rather than real-time; still worth a cheer.
+        for name, values in self.criterion_values.items():
+            total = sum(values.get(c, 0) for c in self.DIAMOND_CRITERIA)
+            base = fun["diamond_base"].get(name)
+            if base is not None and total > base:
+                found = total - base
+                events_say(f"💎  **{name}** mined **{found}** diamond ore "
+                           f"({total:,} all-time)")
+            fun["diamond_base"][name] = total
+
+        # Race watch: announce when the #1 spot in a headline stat changes
+        # hands, and call a race "hot" when #2 closes within 3%.
+        agg = funstats.aggregate(self.criteria, self.criterion_values)
+        playtimes = all_playtimes(self.stats, self.state, now)
+        for label, stat, fmt in self.RACE_STATS:
+            if stat == "playtime":
+                scores = playtimes
+            elif stat == "advancements":
+                scores = {n: e.get("advancements", 0) for n, e in self.stats.items()}
+            else:
+                scores = {n: a.get(stat, 0) for n, a in agg.items()}
+            ranked = sorted((kv for kv in scores.items() if kv[1] > 0),
+                            key=lambda kv: -kv[1])
+            if not ranked:
+                continue
+            leader, top = ranked[0]
+            was = fun["race"].get(stat)
+            fun["race"][stat] = leader
+            if was and was != leader and was in scores:
+                events_say(f"🏁  **{leader}** has overtaken **{was}** for #1 in "
+                           f"**{label}** — {fmt(top)} to {fmt(scores[was])}!")
+            elif len(ranked) > 1:
+                chaser, second = ranked[1]
+                if top and (top - second) / top < 0.03:
+                    key = f"{stat}:{leader}:{chaser}"
+                    if now - fun["race_hot"].get(key, 0) > 7 * 86400:
+                        fun["race_hot"][key] = now
+                        events_say(f"🔥  **The race is on!** {chaser} is within "
+                                   f"{fmt(top - second)} of {leader} in {label} "
+                                   f"({fmt(second)} vs {fmt(top)}).")
+
     def roll_day(self, playtimes, now):
-        """Post the day's recap and reset the daily baselines at 03:00 Eastern."""
+        """The 3:00 am Eastern ceremony: recap, awards, records, streaks.
+
+        Everything about the finished day is computed before the baselines
+        reset — after that its deltas are gone.
+        """
         state = self.state
+        fun = self.fun
         key = day_key(now)
         if state["day"] == key:
             return False
         first_run = state["day"] is None
-        if not first_run and state["day_playtime_baseline"] and CFG["webhook_daily"]:
+
+        if not first_run and state["day_playtime_baseline"]:
+            finished = dt.date.fromisoformat(state["day"])
+            label = finished.strftime("%A, %b %d")
+            base = state["day_playtime_baseline"]
+            played = {n: max(0, t - base.get(n, t)) for n, t in playtimes.items()}
+            deltas = subtract(self.criterion_values, state["day_stat_baseline"])
+            agg = funstats.aggregate(self.criteria, deltas)
+            for name in set(played) | set(fun["chat_today"]):
+                agg.setdefault(name, {})
+                agg[name]["playtime"] = played.get(name, 0)
+                agg[name]["chat"] = fun["chat_today"].get(name, 0)
+
+            # The recap bundle: one post, one notification at most.
             recap = [
                 daily_playtime_embed(state, playtimes, now, final=True),
                 gamestats.period_embed(
-                    self.criteria,
-                    subtract(self.criterion_values, state["day_stat_baseline"]),
-                    "🌙  Yesterday's Statistics", day_label(now - 86400),
+                    self.criteria, deltas,
+                    "🌙  Yesterday's Statistics", label,
                     0xE67E22, "the day that just ended  •  resets at 3:00 am Eastern",
                     CFG["stats_noise_scale"],
                     empty="nothing was recorded yesterday"),
+                funstats.awards_embed(funstats.compute_awards(agg, state["day"]),
+                                      label),
+                funstats.challenge_result_embed(
+                    funstats.pick_challenge(state["day"]), agg, label),
             ]
+            url = CFG["webhook_events"] or CFG["webhook_daily"]
             if DRY_RUN:
-                log("[dry-run] daily recap")
-            else:
+                log("[dry-run] daily recap, awards and challenge result")
+            elif url:
                 try:
-                    discord(CFG["webhook_daily"], "POST",
-                            {"username": "MC Server", "embeds": recap})
+                    discord(url, "POST", {"username": "MC Server", "embeds": recap})
                     log(f"[daily] posted the recap for {state['day']}", mirror=True)
                 except (urllib.error.URLError, OSError) as e:
                     log(f"[error] daily recap post failed: {e}")
+
+            # The record ledger and the streak ledger both advance one day.
+            for emoji, rec_label, name, value, was, was_value in \
+                    funstats.check_records(fun["records"], agg,
+                                           finished.strftime("%b %d")):
+                own = " their own record of" if was == name else f" {was}'s"
+                events_say(f"{emoji}  **Daily record!** {name} set a new best "
+                           f"for **{rec_label.lower()}** — **{value}**, "
+                           f"beating{own} {was_value}.")
+            milestones, broken = funstats.update_streaks(fun["streaks"],
+                                                         played, finished)
+            for name, length in milestones:
+                events_say(f"🔥  **{name}** is on a **{length}-day** playtime streak!")
+            for name, length in broken:
+                events_say(f"💔  **{name}**'s {length}-day streak has ended.")
+
+            # History for pace projections and the chat card, capped at 30 days.
+            fun["history"].append({"day": state["day"], "played": played,
+                                   "chat": dict(fun["chat_today"])})
+            del fun["history"][:-30]
+
+            # World birthdays.
+            if fun["world_first_day"]:
+                age = (stat_day(now)
+                       - dt.date.fromisoformat(fun["world_first_day"])).days
+                if ((age in ANNIVERSARY_DAYS or (age > 0 and age % 365 == 0))
+                        and age not in fun["annv"]):
+                    fun["annv"].append(age)
+                    years = f" — {age // 365} year{'s' if age >= 730 else ''}!" \
+                        if age % 365 == 0 else "!"
+                    events_say(f"🎂  **The world is {age} days old today{years}** "
+                               f"It began on {fun['world_first_day']}.")
+
         if first_run:
             # Starting partway through a day: recover the playtime already
             # earned since 03:00 from the log archive, the same way the weekly
@@ -1478,7 +1774,15 @@ class Bot:
         # necessarily start from wherever they stand right now.
         state["day_stat_baseline"] = {n: dict(v)
                                       for n, v in self.criterion_values.items()}
+        # Yesterday's ranks, for the movement arrows on the all-time board.
+        ranked = sorted((kv for kv in playtimes.items() if kv[1]),
+                        key=lambda kv: -kv[1])
+        fun["ranks"] = {name: i + 1 for i, (name, _) in enumerate(ranked)}
+        fun["chat_today"] = {}
         state["day"] = key
+        emoji, title, _, _ = funstats.pick_challenge(key)
+        events_say(f"🎯  **Today's challenge:** {emoji} {title} — "
+                   f"winner crowned at 3:00 am Eastern.")
         return True
 
     def check_milestones(self, playtimes):
@@ -1525,9 +1829,13 @@ class Bot:
         for name, values in self.criterion_values.items():
             state["stat_baseline"].setdefault(name, dict(values))
         url = CFG["webhook_weekly"]
-        # All-time hours first, then this week's hours, then this week's
-        # statistics. Everything all-time lives in the statistics channel.
-        upsert_embed(url, "alltime", state, alltime_embed(playtimes),
+        fun = self.fun
+        pace = funstats.pace_lines(
+            playtimes, [entry["played"] for entry in fun["history"][-7:]],
+            MILESTONE_HOURS, dt.date.fromtimestamp(now))
+        # All-time hours first, then this week, then the celebration cards.
+        upsert_embed(url, "alltime", state,
+                     alltime_embed(playtimes, fun["ranks"], pace),
                      reposition=rolled)
         upsert_embed(url, "weekly", state, weekly_embed(state, playtimes, now),
                      reposition=rolled)
@@ -1537,6 +1845,16 @@ class Bot:
                          subtract(self.criterion_values, state["stat_baseline"]),
                          week_label(now), CFG["stats_noise_scale"]),
                      reposition=rolled)
+        time.sleep(0.4)
+        upsert_embed(url, "records", state,
+                     funstats.records_embed(fun["records"]))
+        upsert_embed(url, "streaks", state,
+                     funstats.streaks_embed(fun["streaks"]))
+        time.sleep(0.4)
+        upsert_embed(url, "primetime", state,
+                     funstats.primetime_embed(fun["hours"]))
+        upsert_embed(url, "chatstats", state,
+                     funstats.chat_embed(fun["chat_total"], fun["chat_today"]))
 
     def do_daily(self, now):
         """Roll the statistics day at 03:00 Eastern, and keep today's cards fresh."""
@@ -1553,7 +1871,7 @@ class Bot:
             state["day_stat_baseline"].setdefault(name, dict(values))
         if rolled or now - self.last_daily_cards >= CFG["daily_card_seconds"]:
             self.last_daily_cards = now
-            self.refresh_daily_cards(now, rolled=rolled)
+            self.refresh_daily_cards(now)
             save_state(state)
 
     def refresh_stat_cards(self):
@@ -1563,10 +1881,24 @@ class Bot:
             return
         state = self.state
         scale = CFG["stats_noise_scale"]
-        wanted = ["stat_overview"]
+        wanted = ["stat_overview", "stat_spotlight", "stat_advrace"]
         upsert_embed(url, "stat_overview", state,
                      gamestats.overview_embed(self.criteria, self.criterion_values,
                                               len(self.criterion_values), scale))
+        today = day_key(time.time())
+        spotlight = funstats.pick_spotlight(
+            [n for n, e in self.stats.items() if e.get("play_time", 0) >= 3600],
+            today)
+        if spotlight:
+            time.sleep(0.4)
+            upsert_embed(url, "stat_spotlight", state,
+                         funstats.spotlight_embed(spotlight,
+                                                  self.stats[spotlight], today))
+        done_sets = load_advancement_sets(self.stats)
+        if done_sets:
+            time.sleep(0.4)
+            upsert_embed(url, "stat_advrace", state,
+                         funstats.advancements_embed(done_sets))
         for key, embed in gamestats.category_embeds(
                 self.criteria, self.criterion_values, curated=self.curated,
                 top=CFG["stats_top_per_category"], scale=scale):
@@ -1577,37 +1909,42 @@ class Bot:
             upsert_embed(url, f"stat_{key}", state, embed)
         self.drop_unused_cards(url, "stat_", wanted)
 
-    def refresh_daily_cards(self, now, rolled=False):
-        """Today's statistics: the same categories, counted since 03:00 Eastern."""
+    def refresh_daily_cards(self, now):
+        """Today's statistics: the same categories, counted since 03:00 Eastern.
+
+        Every card here is only ever edited in place — never deleted, never
+        re-posted — so this channel produces no messages and no notifications.
+        Categories that are empty this early in the day say so on their card
+        rather than disappearing, which is what keeps the set stable.
+        """
         url = CFG["webhook_daily"]
         if not url or not self.criteria:
             return
         state = self.state
         scale = CFG["stats_noise_scale"]
         deltas = subtract(self.criterion_values, state["day_stat_baseline"])
+        agg = funstats.aggregate(self.criteria, deltas)
         playtimes = all_playtimes(self.stats, state, now)
-        cards = [(f"daily_{key}", embed) for key, embed in gamestats.category_embeds(
-            self.criteria, deltas, top=CFG["daily_top_per_category"],
-            title_suffix="  ·  Today", scale=scale, skip_empty=True)]
-        wanted = ["daily_overview", "daily_playtime"] + [key for key, _ in cards]
-        # A card's place in the channel is fixed when it is first posted, and
-        # categories come and go all day as players do new things. Whenever the
-        # set changes, lay the whole channel out again so it stays in order.
-        reposition = rolled or state.get("daily_layout") != wanted
-        state["daily_layout"] = wanted
         upsert_embed(url, "daily_overview", state,
                      daily_overview_embed(state, self.criteria, deltas,
-                                          playtimes, now),
-                     reposition=reposition)
+                                          playtimes, now))
         time.sleep(0.4)
         upsert_embed(url, "daily_playtime", state,
-                     daily_playtime_embed(state, playtimes, now),
-                     reposition=reposition)
-        for key, embed in cards:
+                     daily_playtime_embed(state, playtimes, now))
+        time.sleep(0.4)
+        upsert_embed(url, "daily_challenge", state,
+                     funstats.challenge_embed(
+                         funstats.pick_challenge(state["day"] or day_key(now)),
+                         agg, day_label(now)))
+        wanted = ["daily_overview", "daily_playtime", "daily_challenge"]
+        for key, embed in gamestats.category_embeds(
+                self.criteria, deltas, top=CFG["daily_top_per_category"],
+                title_suffix="  ·  Today", scale=scale):
+            wanted.append(f"daily_{key}")
             # Space the updates out: a webhook allows roughly five requests
             # every two seconds, and this is a whole channel of cards at once.
             time.sleep(0.4)
-            upsert_embed(url, key, state, embed, reposition=reposition)
+            upsert_embed(url, f"daily_{key}", state, embed)
         self.drop_unused_cards(url, "daily_", wanted)
 
     def drop_unused_cards(self, url, prefix, wanted):
@@ -1627,6 +1964,13 @@ class Bot:
         # First, so the transcript stays close to live even when the slower
         # card work below runs.
         flush_chat()
+        # The prime-time ledger: whoever is on right now is on during this
+        # clock hour. Capped in case the loop was suspended (laptop lid).
+        elapsed = min(max(0.0, now - self.last_loop), 120.0)
+        self.last_loop = now
+        if self.state["players"] and elapsed:
+            hour = time.localtime(now).tm_hour
+            self.fun["hours"][hour] += len(self.state["players"]) * elapsed
         if now - self.last_ping >= CFG["ping_seconds"]:
             self.last_ping = now
             self.do_ping(now)
@@ -1635,6 +1979,7 @@ class Bot:
             self.stats = load_stats()
             self.refresh_criteria()
             self.check_milestones(all_playtimes(self.stats, self.state, now))
+            self.check_fun(now)
         if (CFG["external_check"] and CFG["public_address"]
                 and now - self.last_external >= CFG["external_check_minutes"] * 60):
             self.last_external = now
@@ -1660,6 +2005,7 @@ class Bot:
     def run_once(self):
         self.sweep()
         self.replay()
+        self.seed_engagement()
         now = time.time()
         self.do_ping(now)
         self.stats = load_stats()
@@ -1684,6 +2030,7 @@ class Bot:
         log(f"[start] watching {CFG['server_dir']}", mirror=True)
         self.sweep()
         self.replay()
+        self.seed_engagement()
         self.reader.seek_end()
         self.do_ping(time.time())
         self.stats = load_stats()
