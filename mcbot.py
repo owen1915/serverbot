@@ -107,6 +107,8 @@ DEFAULTS = {
     # Fun facts about a random online player, told in game chat. Roughly
     # this many an hour, at jittered moments; 0 turns them off.
     "fun_facts_per_hour": 3,
+    # Cycle a labelled statistic through the tab list, on the same timer.
+    "tab_stats": True,
     # Keep the MOTD fresh through MiniMOTD's config. Also needs RCON.
     "dynamic_motd": True,
     "motd_refresh_seconds": 600,
@@ -1269,6 +1271,7 @@ FUN_DEFAULTS = {
     "motd_sig": "",           # what the MOTD currently says, to skip rewrites
     "fact_recent": [],        # who the fun facts featured lately, newest last
     "fact_kinds": [],         # which kinds of fact were told lately
+    "fact_history": [],       # [epoch, name, kind] — nothing repeats in an hour
     "next_fact": 0.0,         # when the next fact is due — survives restarts
 }
 
@@ -1782,6 +1785,57 @@ class Bot:
     FACT_COLORS = ("aqua", "green", "yellow", "gold", "light_purple",
                    "red", "blue", "dark_aqua", "white")
 
+    # What the tab list can show: label, and where each player's number
+    # comes from. "agg" keys read the lifetime aggregate; callables read
+    # anything else. Values are lifetime, like the facts.
+    TAB_STATS = [
+        ("blocks mined", "mined", "{:,.0f}"),
+        ("deaths", "deaths", "{:,.0f}"),
+        ("hours played",
+         lambda self, agg, name: self.stats.get(name, {}).get("play_time", 0) / 3600,
+         "{:,.0f}"),
+        ("mob kills", "killed", "{:,.0f}"),
+        ("km travelled",
+         lambda self, agg, name: agg.get(name, {}).get("distance", 0) / 100_000,
+         "{:,.1f}"),
+        ("blocks placed", "placed", "{:,.0f}"),
+        ("jumps", "jumps", "{:,.0f}"),
+        ("diamond ore",
+         lambda self, agg, name: sum(
+             self.criterion_values.get(name, {}).get(c, 0)
+             for c in Bot.DIAMOND_CRITERIA),
+         "{:,.0f}"),
+        ("fish caught", "fish", "{:,.0f}"),
+        ("villager trades", "trades", "{:,.0f}"),
+    ]
+
+    def rotate_tab(self, online):
+        """Show the next statistic in the tab list, labelled on every row.
+
+        A dummy objective sits in the tab-list slot; each rotation rewrites
+        every online player's score with a fixed number format like
+        "1,234 blocks mined", so the tab says what it is showing.
+        """
+        if not CFG["tab_stats"] or not online:
+            return
+        agg = funstats.aggregate(self.criteria, self.criterion_values)
+        index = self.fun.get("tab_index", 0) % len(self.TAB_STATS)
+        self.fun["tab_index"] = index + 1
+        label, source, fmt = self.TAB_STATS[index]
+        cmds = ["scoreboard objectives add mcbot_tab dummy"]
+        for name in online:
+            if callable(source):
+                value = source(self, agg, name)
+            else:
+                value = agg.get(name, {}).get(source, 0)
+            shown = fmt.format(value)
+            cmds.append(f"scoreboard players set {name} mcbot_tab {int(value)}")
+            cmds.append(f"scoreboard players display numberformat {name} "
+                        f'mcbot_tab fixed "{shown} {label}"')
+        cmds.append("scoreboard objectives setdisplay list mcbot_tab")
+        if rcon.commands(CFG["server_dir"], cmds) is not None:
+            log(f"[tab] now showing {label}")
+
     def maybe_fun_fact(self, now):
         """Every so often, tell the room something true about somebody in it.
 
@@ -1806,25 +1860,46 @@ class Bot:
         online = [n for n in self.state["players"] if n in self.stats]
         if not online:
             return
-        # Prefer whoever has not featured in the last two facts; failing
-        # that, anyone but the very last subject. Only a player alone on the
-        # server can be the subject twice running.
+        # The tab list rotates on the same beat, even when every fact has
+        # already been told this hour.
+        self.rotate_tab(online)
+        # No fact repeats within an hour: everything said in the last hour
+        # (player + kind) is off the table.
+        fun["fact_history"] = [h for h in fun["fact_history"] if h[0] >= now - 3600]
+        said = {(h[1], h[2]) for h in fun["fact_history"]}
+        # Prefer whoever has not featured in the last two facts. The very
+        # last subject is excluded outright unless they are alone on the
+        # server — but a recent subject may still be chosen when only they
+        # have something unsaid left.
         recent = fun["fact_recent"]
-        fresh = [n for n in online if n not in recent[-2:]]
-        if not fresh:
-            fresh = [n for n in online if n != (recent[-1] if recent else "")]
-        name = random.choice(fresh or online)
-        facts = funstats.fun_facts(
-            name, self.stats[name],
-            chat_total=fun["chat_total"].get(name, 0),
-            streak=fun["streaks"].get(name, {}).get("current", 0))
-        unworn = [f for f in facts if f[0] not in fun["fact_kinds"][-6:]]
-        kind, fact = random.choice(unworn or facts)
+        last = recent[-1] if recent else ""
+        if len(online) == 1:
+            pool = list(online)
+        else:
+            preferred = [n for n in online if n not in recent[-2:]]
+            backup = [n for n in online if n not in preferred and n != last]
+            pool = (random.sample(preferred, len(preferred))
+                    + random.sample(backup, len(backup)))
+        for name in pool:
+            facts = funstats.fun_facts(
+                name, self.stats[name],
+                chat_total=fun["chat_total"].get(name, 0),
+                streak=fun["streaks"].get(name, {}).get("current", 0))
+            available = [f for f in facts if (name, f[0]) not in said]
+            if available:
+                break
+        else:
+            log("[fact] everything about everybody online was already said "
+                "this hour — staying quiet")
+            return
+        unworn = [f for f in available if f[0] not in fun["fact_kinds"][-6:]]
+        kind, fact = random.choice(unworn or available)
         if rcon.broadcast(CFG["server_dir"], f"Did you know? {fact}",
                           color=random.choice(self.FACT_COLORS)) is None:
             return  # nobody heard it — keep it out of the transcript too
         fun["fact_recent"] = (fun["fact_recent"] + [name])[-4:]
         fun["fact_kinds"] = (fun["fact_kinds"] + [kind])[-8:]
+        fun["fact_history"].append([now, name, kind])
         chat_say(f"✨  *Did you know? {fact}*")
         log(f"[fact] ({kind}) {fact}")
 

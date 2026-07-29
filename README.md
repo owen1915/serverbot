@@ -250,8 +250,16 @@ off, so nothing breaks when it isn't available:
 - **Fun facts** (`fun_facts_per_hour`, default 3) — every so often, at jittered
   moments, the game chat is told something true about a random online player, drawn
   from their own save: "Did you know? Creeper has killed owen1915 9 times. A true
-  nemesis." Whoever was featured most recently is skipped, small numbers are never
-  announced, and each fact is mirrored into the chat transcript
+  nemesis." Around thirty kinds of fact exist (favorite block, nemesis, marathons
+  walked, elytra km, death rate, mining rate…), each in a random chat color. Nothing
+  repeats within an hour, the last six *kinds* of fact are avoided, the last subject
+  is never chosen again unless they are alone, small numbers are never announced, an
+  empty server is told nothing, and each delivered fact is mirrored into the chat
+  transcript. The schedule persists in state, so restarts do not bunch facts together
+- **Cycling tab list** (`tab_stats`) — on the same beat, the tab list shows the next
+  statistic in rotation, labelled on every row via a fixed number format:
+  "owen1915  1,234 blocks mined". Ten statistics cycle: mined, deaths, hours, mob
+  kills, km travelled, placed, jumps, diamond ore, fish, trades
 - **Dynamic MOTD** (`dynamic_motd`) — see below
 
 ## The dynamic MOTD

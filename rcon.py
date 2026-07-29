@@ -67,8 +67,8 @@ def _read_packet(sock):
     return request_id, kind, payload[8:-2].decode("utf-8", "replace")
 
 
-def command(server_dir, text, timeout=5):
-    """Run one command on the local server; its response as plain text.
+def commands(server_dir, texts, timeout=5):
+    """Run several commands over one connection; their responses in order.
 
     Returns None when RCON is off, unreachable, or refuses the password —
     callers treat all three as "the server cannot be asked right now".
@@ -84,11 +84,20 @@ def command(server_dir, text, timeout=5):
             request_id, _, _ = _read_packet(sock)
             if request_id == -1:
                 raise RconError("authentication rejected")
-            sock.sendall(_packet(2, COMMAND, text))
-            _, _, body = _read_packet(sock)
-            return SECTION_RE.sub("", body)
+            out = []
+            for text in texts:
+                sock.sendall(_packet(2, COMMAND, text))
+                _, _, body = _read_packet(sock)
+                out.append(SECTION_RE.sub("", body))
+            return out
     except (OSError, RconError):
         return None
+
+
+def command(server_dir, text, timeout=5):
+    """Run one command on the local server; its response as plain text."""
+    out = commands(server_dir, [text], timeout)
+    return out[0] if out else None
 
 
 # ------------------------------------------------------------- tick health --

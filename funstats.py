@@ -546,6 +546,55 @@ def fun_facts(name, entry, chat_total=0, streak=0):
     slept = custom.get("minecraft:sleep_in_bed", 0)
     if slept >= 5:
         facts.append(("sleep", f"{name} has slept through {slept:,} nights"))
+    signature = top("minecraft:crafted")
+    if signature and signature[1] >= 200:
+        facts.append(("crafted", f"{name} has crafted {signature[1]:,} "
+                                 f"{signature[0]} — their signature product"))
+    grabbed = top("minecraft:picked_up")
+    if grabbed and grabbed[1] >= 500:
+        facts.append(("grabbed", f"{name} has picked {grabbed[1]:,} "
+                                 f"{grabbed[0]} up off the ground"))
+    dropped = sum(raw.get("minecraft:dropped", {}).values())
+    if dropped >= 500:
+        facts.append(("dropped", f"{name} has dropped {dropped:,} items "
+                                 f"on the floor"))
+    mobs = entry.get("mob_kills", 0)
+    if mobs >= 100:
+        facts.append(("mobs", f"{name} has slain {mobs:,} mobs in total"))
+    dealt = entry.get("damage_dealt", 0) / 2
+    if dealt >= 250:
+        facts.append(("dealt", f"{name} has dealt {dealt:,.0f} hearts of "
+                               f"damage in their career"))
+    boat_km = custom.get("minecraft:boat_one_cm", 0) / 100_000
+    if boat_km >= 5:
+        facts.append(("boat", f"{name} has sailed {boat_km:,.0f} km by boat"))
+    flown = custom.get("minecraft:aviate_one_cm", 0) / 100_000
+    if flown >= 5:
+        facts.append(("elytra", f"{name} has flown {flown:,.0f} km on elytra"))
+    climbed = custom.get("minecraft:climb_one_cm", 0) / 100
+    if climbed >= 500:
+        facts.append(("climb", f"{name} has climbed {climbed:,.0f} m of "
+                               f"ladders and vines"))
+    fallen = custom.get("minecraft:fall_one_cm", 0) / 100
+    if fallen >= 300:
+        facts.append(("fall", f"{name} has fallen {fallen:,.0f} m in total. Ouch"))
+    swum_km = custom.get("minecraft:swim_one_cm", 0) / 100_000
+    if swum_km >= 1:
+        facts.append(("swim", f"{name} has swum {swum_km:,.1f} km"))
+    enchanted = custom.get("minecraft:enchant_item", 0)
+    if enchanted >= 5:
+        facts.append(("enchant", f"{name} has enchanted {enchanted:,} items"))
+    raids = entry.get("raid_wins", 0)
+    if raids >= 1:
+        facts.append(("raids", f"{name} has won {raids} "
+                               f"raid{'s' if raids != 1 else ''}"))
+    if deaths >= 5 and hours >= 5:
+        facts.append(("death_rate", f"{name} dies once every "
+                                    f"{hours / deaths:.1f} hours, on average"))
+    mined_total = sum(raw.get("minecraft:mined", {}).values())
+    if mined_total >= 1000 and hours >= 2:
+        facts.append(("mine_rate", f"{name} mines about "
+                                   f"{mined_total / hours:,.0f} blocks an hour"))
     if chat_total >= 25:
         facts.append(("chat", f"{name} has sent {chat_total:,} chat messages"))
     if streak >= 3:

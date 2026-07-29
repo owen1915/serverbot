@@ -520,7 +520,9 @@ def test_fun_facts():
     entry = {
         "raw": {"minecraft:mined": {"minecraft:netherrack": 55_660},
                 "minecraft:killed_by": {"minecraft:creeper": 9},
-                "minecraft:custom": {"minecraft:jump": 17_353}},
+                "minecraft:custom": {"minecraft:jump": 17_353,
+                                     "minecraft:aviate_one_cm": 730_000_000,
+                                     "minecraft:fall_one_cm": 45_000}},
         "deaths": 16, "distance_cm": 42_195_000, "play_time": 3600 * 53,
         "fish_caught": 1, "trades": 2, "animals_bred": 0, "damage_taken": 0,
     }
@@ -535,6 +537,11 @@ def test_fun_facts():
     check("chat and streak facts appear",
           "500 chat messages" in joined and "4 days in a row" in joined, True)
     check("every fact carries a distinct kind", len(kinds), len(set(kinds)))
+    check("elytra distance appears", "flown 7,300 km on elytra" in joined, True)
+    check("falls appear", "fallen 450 m in total" in joined, True)
+    check("death rate is computed", "dies once every 3.3 hours" in joined, True)
+    check("mining rate is computed", "mines about 1,050 blocks an hour" in joined,
+          True)
     check("an empty save yields the mystery fact",
           funstats.fun_facts("ghost", {"raw": {}}),
           [("mystery", "ghost remains a person of complete mystery")])
