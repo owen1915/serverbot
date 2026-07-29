@@ -42,6 +42,7 @@ def aggregate(criteria, per_player):
     challenge standings and the race watch, so they can never disagree about
     what somebody did.
     """
+    blocks = gamestats.block_item_ids(criteria)
     plan = []
     for criterion in criteria:
         parts = gamestats.split_criterion(criterion)
@@ -59,12 +60,17 @@ def aggregate(criteria, per_player):
             for name, wanted in SECTION_KEYS.items():
                 if section == wanted:
                     plan.append((criterion, name))
-    empty = {key: 0 for key in [*SECTION_KEYS, *CUSTOM_KEYS, "distance"]}
+            # Placing a block is "using" its item; split those out of used.
+            if section == "minecraft:used" and key in blocks:
+                plan.append((criterion, "placed"))
+    empty = {key: 0 for key in [*SECTION_KEYS, *CUSTOM_KEYS,
+                                "distance", "placed"]}
     out = {}
     for player, values in per_player.items():
         agg = dict(empty)
         for criterion, name in plan:
             agg[name] += values.get(criterion, 0)
+        agg["blocks"] = agg["mined"] + agg["placed"]
         out[player] = agg
     return out
 
@@ -101,6 +107,10 @@ AWARDS = [
         "the caves echo with their pickaxe.",
         "singlehandedly lowering the world's average altitude.",
         "somewhere, a mountain is missing.")),
+    ("builder", "🧱", "Master Builder", "placed", 128, "count", (
+        "the skyline is different now.",
+        "one block at a time, a monument.",
+        "the world is their canvas, and the canvas is cobblestone.")),
     ("hunter", "🗡️", "Menace to Wildlife", "killed", 15, "count", (
         "the mobs have formed a support group.",
         "the food chain has a new apex.",
@@ -185,6 +195,8 @@ def awards_embed(awards, label):
 RECORDS = [
     ("playtime", "🕰️", "Longest day", "playtime", 900, "time"),
     ("mined", "⛏️", "Most blocks mined", "mined", 256, "count"),
+    ("placed", "🧱", "Most blocks placed", "placed", 256, "count"),
+    ("blocks", "🏗️", "Most blocks mined + placed", "blocks", 512, "count"),
     ("killed", "🗡️", "Most mobs killed", "killed", 25, "count"),
     ("crafted", "⚒️", "Most items crafted", "crafted", 128, "count"),
     ("distance", "🏃", "Furthest travelled", "distance", 1_000_000, "distance"),

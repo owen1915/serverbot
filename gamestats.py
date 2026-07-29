@@ -227,6 +227,35 @@ def format_value(criterion, value):
     return f"{int(value):,}"
 
 
+# ---------------------------------------------------------- placed blocks --
+
+# Minecraft has no "blocks placed" statistic: placing a block counts as using
+# its item, in minecraft:used alongside eating bread and throwing pearls. The
+# ids that are blocks are learned from the save itself — anything the server
+# has ever seen mined is a block — rather than from a hardcoded registry.
+
+
+def block_item_ids(criteria):
+    """Item ids known to be blocks: everything ever mined on this server."""
+    out = set()
+    for criterion in criteria:
+        parts = split_criterion(criterion)
+        if parts and parts[0] == "minecraft:mined":
+            out.add(parts[1])
+    return out
+
+
+def placed_criteria(criteria):
+    """The minecraft:used criteria that are block placements."""
+    blocks = block_item_ids(criteria)
+    out = []
+    for criterion in criteria:
+        parts = split_criterion(criterion)
+        if parts and parts[0] == "minecraft:used" and parts[1] in blocks:
+            out.append(criterion)
+    return out
+
+
 # ------------------------------------------------------------- noise floor --
 
 # The save records every statistic a player has touched even once, so without a
@@ -501,6 +530,16 @@ def summary_totals(criteria, per_player):
         value = total(by_section.get(section, []))
         if value:
             out.append((emoji, label, f"{int(value):,}"))
+    # Placed blocks live inside minecraft:used; pull them out and show the
+    # combined earthworks figure next to the mining they belong with.
+    mined = total(by_section.get("minecraft:mined", []))
+    placed = total(placed_criteria(criteria))
+    if placed:
+        at = next((i for i, tile in enumerate(out)
+                   if tile[1] == "Blocks Mined"), len(out) - 1) + 1
+        out.insert(at, ("🧱", "Blocks Placed", f"{int(placed):,}"))
+        out.insert(at + 1, ("🏗️", "Blocks Mined + Placed",
+                            f"{int(mined + placed):,}"))
     # Distance is spread over a dozen criteria — walking, sprinting, boating,
     # falling — and is only meaningful added up.
     travelled = [c for c in by_section.get("minecraft:custom", [])

@@ -357,12 +357,16 @@ def test_summary_totals():
     import gamestats
     criteria = ["minecraft.mined:minecraft.stone",
                 "minecraft.mined:minecraft.dirt",
+                "minecraft.used:minecraft.stone",
+                "minecraft.used:minecraft.bread",
                 "minecraft.custom:minecraft.deaths",
                 "minecraft.custom:minecraft.walk_one_cm",
                 "minecraft.custom:minecraft.sprint_one_cm",
                 "minecraft.custom:minecraft.fish_caught"]
     per_player = {
         "ann": {"minecraft.mined:minecraft.stone": 400,
+                "minecraft.used:minecraft.stone": 60,
+                "minecraft.used:minecraft.bread": 25,
                 "minecraft.custom:minecraft.deaths": 2,
                 "minecraft.custom:minecraft.walk_one_cm": 150_000},
         "bob": {"minecraft.mined:minecraft.stone": 100,
@@ -373,6 +377,9 @@ def test_summary_totals():
            gamestats.summary_totals(criteria, per_player)}
     check("a section is summed across items and players",
           got.get("Blocks Mined"), "540")
+    check("placing counts used block items only, not bread",
+          got.get("Blocks Placed"), "60")
+    check("mined and placed combine", got.get("Blocks Mined + Placed"), "600")
     check("deaths are counted", got.get("Deaths"), "2")
     check("distance is summed across every way of moving",
           got.get("Distance Travelled"), "4.0km")
@@ -388,11 +395,15 @@ def test_celebrations():
     import funstats
 
     criteria = ["minecraft.mined:minecraft.stone",
+                "minecraft.used:minecraft.stone",
+                "minecraft.used:minecraft.bread",
                 "minecraft.killed:minecraft.zombie",
                 "minecraft.custom:minecraft.deaths",
                 "minecraft.custom:minecraft.walk_one_cm"]
     per_player = {
         "ann": {"minecraft.mined:minecraft.stone": 900,
+                "minecraft.used:minecraft.stone": 150,
+                "minecraft.used:minecraft.bread": 40,
                 "minecraft.custom:minecraft.walk_one_cm": 700_000},
         "bob": {"minecraft.killed:minecraft.zombie": 30,
                 "minecraft.custom:minecraft.deaths": 4},
@@ -401,6 +412,8 @@ def test_celebrations():
     check("aggregation sums a section", agg["ann"]["mined"], 900)
     check("aggregation reads custom stats", agg["bob"]["deaths"], 4)
     check("absent statistics aggregate to zero", agg["ann"]["deaths"], 0)
+    check("placed counts block items, not bread", agg["ann"]["placed"], 150)
+    check("mined and placed combine", agg["ann"]["blocks"], 1050)
 
     for name, extra in (("ann", {"playtime": 7200, "chat": 0}),
                         ("bob", {"playtime": 3600, "chat": 12})):

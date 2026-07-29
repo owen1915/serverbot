@@ -124,8 +124,17 @@ and reset at **3:00 am Eastern** rather than midnight so a late-night session st
 day it felt like it belonged to.
 
 - 🌞 **Today at a Glance** — every headline total added up across the whole server:
-  blocks mined, items crafted and used, mobs killed, distance travelled, deaths, damage,
-  trades, nights slept, raids won — plus who leads the most of today's statistics
+  blocks mined, placed, and mined + placed combined, items crafted and used, mobs
+  killed, distance travelled, deaths, damage, trades, nights slept, raids won — plus
+  who leads the most of today's statistics
+
+Minecraft has no "blocks placed" statistic — placing a block counts as *using* its
+item, filed alongside eating bread. The bot pulls placements out of `minecraft:used` by
+learning which item ids are blocks from the save itself: anything the server has ever
+seen mined is a block. No hardcoded registry, so new blocks in new versions just work
+(a block placed but never once mined by anybody is missed until someone breaks one).
+Placed and mined + placed also feed a 🧱 **Master Builder** daily award and two entries
+on the single-day records ledger.
 - 📅 **Today's Playtime** — who has played today, seeded from the log archive when the
   watcher starts partway through a day
 - 🎯 **Today's Challenge** — live standings for the day's competition
