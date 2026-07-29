@@ -33,6 +33,7 @@ import urllib.request
 
 import funstats
 import gamestats
+import ledger
 import perf
 import rcon
 
@@ -971,10 +972,12 @@ def replace_motd_block(text, entries_text):
     admin set it to. Brackets are counted rather than matched by regex —
     the list nests one level of braces per entry.
     """
-    start = text.find("motd=[")
-    if start < 0:
-        start = text.find("motd = [")
-    if start < 0:
+    for key in ("motds=[", "motds = [", "motd=[", "motd = ["):
+        start = text.find(key)
+        if start >= 0:
+            keyword = key.split("=")[0]
+            break
+    else:
         return None
     open_at = text.index("[", start)
     depth = 0
@@ -984,7 +987,7 @@ def replace_motd_block(text, entries_text):
         elif text[i] == "]":
             depth -= 1
             if depth == 0:
-                return text[:start] + "motd=" + entries_text + text[i + 1:]
+                return text[:start] + keyword + "=" + entries_text + text[i + 1:]
     return None
 
 
@@ -2135,7 +2138,15 @@ class Bot:
         time.sleep(0.4)
         upsert_embed(url, "daily_playtime", state,
                      daily_playtime_embed(state, playtimes, now))
-        wanted = ["daily_overview", "daily_playtime"]
+        # Ground truth from Ledger's event log, where the mod is installed.
+        # Always in the wanted list so a briefly-busy database does not
+        # delete the card; it just keeps yesterday's numbers for a cycle.
+        report = ledger.activity(CFG["server_dir"], day_start_epoch(now))
+        if report:
+            time.sleep(0.4)
+            upsert_embed(url, "daily_building", state,
+                         ledger.building_embed(report, day_label(now)))
+        wanted = ["daily_overview", "daily_playtime", "daily_building"]
         for key, embed in gamestats.category_embeds(
                 self.criteria, deltas, top=CFG["daily_top_per_category"],
                 title_suffix="  ·  Today", scale=scale):

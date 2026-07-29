@@ -271,9 +271,16 @@ server name is taken from server.properties `motd` and dressed in a gradient.
 ## Server-side mods
 
 The bot needs none of these, but uses them when present: **spark** (installed),
-**MiniMOTD** (dynamic MOTD above), **Ledger** with **Fabric Language Kotlin** (block
-logging to SQLite — reader planned: true placed-block counts, busiest chunk, activity
-by hour).
+**MiniMOTD** (dynamic MOTD above), and **Ledger** with **Fabric Language Kotlin**.
+
+Ledger logs every block place and break, container move and player kill to
+`world/ledger.sqlite` (WAL-journaled and indexed on time, so read-only queries beside a
+running server are safe). The daily channel gains a 📐 **Building Report** card from
+it: per-player placed/broken/container-moves/kills as *events that actually happened*
+rather than statistics inferred from item use, the day's dimension split, and the
+busiest chunk with coordinates. Ledger's timestamps are naive local time, so queries
+are bounded with local-time strings; a briefly locked database keeps the previous
+card's numbers for a cycle instead of flashing empty.
 
 ## Setup
 

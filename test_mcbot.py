@@ -494,7 +494,8 @@ def test_rcon_and_motd():
     check("a lagging server reports real TPS", lagging["tps"], 10.0)
     check("garbage parses to None", rcon.parse_tick("Unknown command"), None)
 
-    config = ('modify-player-count=false\nmotd=[\n    {\n        icon=random\n'
+    # MiniMOTD's real key is the plural "motds".
+    config = ('modify-player-count=false\nmotds=[\n    {\n        icon=random\n'
               '        line1="old"\n        line2="old"\n    }\n]\nsome-toggle=true\n')
     entries = mcbot.render_motd_entries([("<gradient>Name</gradient>", "<gray>fact one"),
                                          ("<gradient>Name</gradient>", "fact two")])
@@ -511,6 +512,65 @@ def test_rcon_and_motd():
     check("markdown is stripped for the in-game mirror",
           rcon.NON_TEXT_RE.sub("", stripped).strip(),
           "owen1915 is on a 3-day streak!")
+
+
+def test_ledger():
+    """The Ledger reader: counts, the time boundary, and the busiest chunk."""
+    import sqlite3
+    import time as time_mod
+    import ledger
+
+    server = tempfile.mkdtemp()
+    os.makedirs(os.path.join(server, "world"))
+    db = sqlite3.connect(os.path.join(server, "world", "ledger.sqlite"))
+    db.executescript("""
+        CREATE TABLE players (id INTEGER PRIMARY KEY, player_id TEXT,
+            player_name TEXT, first_join TEXT, last_join TEXT);
+        CREATE TABLE ActionIdentifiers (id INTEGER PRIMARY KEY,
+            action_identifier TEXT);
+        CREATE TABLE worlds (id INTEGER PRIMARY KEY, identifier TEXT);
+        CREATE TABLE actions (id INTEGER PRIMARY KEY, action_id INT, time TEXT,
+            x INT, y INT, z INT, world_id INT, object_id INT, old_object_id INT,
+            block_state TEXT, old_block_state TEXT, source INT, player_id INT,
+            extra_data TEXT, rolled_back INT);
+        INSERT INTO players VALUES (1, 'u1', 'ann', '', ''), (2, 'u2', 'bob', '', '');
+        INSERT INTO ActionIdentifiers VALUES (1, 'block-break'), (2, 'block-place'),
+            (8, 'entity-kill'), (4, 'item-insert');
+        INSERT INTO worlds VALUES (1, 'minecraft:overworld'), (3, 'minecraft:the_nether');
+    """)
+    now = time_mod.time()
+    recent = time_mod.strftime("%Y-%m-%d %H:%M:%S.000", time_mod.localtime(now - 60))
+    old = time_mod.strftime("%Y-%m-%d %H:%M:%S.000", time_mod.localtime(now - 7200))
+    rows = ([(2, recent, 100 + i, 64, 200, 1, 1, None, None, None, 1, 1)
+             for i in range(5)]           # ann places 5 blocks in one chunk
+            + [(1, recent, -300, 64, -300, 3, 1, None, None, None, 1, 2)]  # bob breaks 1
+            + [(8, recent, 0, 64, 0, 1, 1, None, None, None, 1, 2)]        # bob kills 1
+            + [(4, recent, 0, 64, 0, 1, 1, None, None, None, 1, 1)]        # ann chest
+            + [(2, old, 0, 64, 0, 1, 1, None, None, None, 1, 1)] * 3)      # too old
+    db.executemany("INSERT INTO actions (action_id, time, x, y, z, world_id, "
+                   "object_id, old_object_id, block_state, old_block_state, "
+                   "source, player_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+    db.commit()
+    db.close()
+
+    report = ledger.activity(server, now - 600)
+    check("placements counted", report["players"]["ann"]["placed"], 5)
+    check("container moves counted", report["players"]["ann"]["containers"], 1)
+    check("breaks and kills counted",
+          (report["players"]["bob"]["broken"], report["players"]["bob"]["kills"]),
+          (1, 1))
+    check("events before the boundary are excluded",
+          report["players"]["ann"]["placed"] + report["players"]["bob"]["broken"], 6)
+    check("the busiest chunk is the build site",
+          (report["busiest"][0], report["busiest"][3]),
+          ("minecraft:overworld", 5))
+    check("world split covers both dimensions",
+          report["worlds"]["minecraft:the_nether"], 1)
+    embed = ledger.building_embed(report, "Wednesday")
+    check("the card names the builder", "**ann** — placed **5**" in
+          embed["description"], True)
+    check("a missing database reads as None",
+          ledger.activity(tempfile.mkdtemp(), now), None)
 
 
 def test_chat_transcript():
@@ -584,6 +644,8 @@ def main():
     test_celebrations()
     print()
     test_rcon_and_motd()
+    print()
+    test_ledger()
     print()
     test_chat_transcript()
     print()
