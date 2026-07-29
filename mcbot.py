@@ -105,6 +105,10 @@ DEFAULTS = {
     # Keep the MOTD fresh through MiniMOTD's config. Also needs RCON.
     "dynamic_motd": True,
     "motd_refresh_seconds": 600,
+    # The day the world began, for "Day N" and anniversaries. Set this when
+    # the log archive does not reach back to the real first day; empty falls
+    # back to the oldest date in the archive.
+    "world_started": "",
     # Announce deaths and advancements.
     "announce_deaths": True,
     "announce_advancements": True,
@@ -1802,8 +1806,6 @@ class Bot:
                     CFG["stats_noise_scale"],
                     empty="nothing was recorded yesterday"),
                 funstats.awards_embed(awards, label),
-                funstats.challenge_result_embed(
-                    funstats.pick_challenge(state["day"]), agg, label),
             ]
             url = CFG["webhook_events"] or CFG["webhook_daily"]
             if DRY_RUN:
@@ -1836,9 +1838,8 @@ class Bot:
             del fun["history"][:-30]
 
             # World birthdays.
-            if fun["world_first_day"]:
-                age = (stat_day(now)
-                       - dt.date.fromisoformat(fun["world_first_day"])).days
+            if self.world_start():
+                age = (stat_day(now) - self.world_start()).days
                 if ((age in ANNIVERSARY_DAYS or (age > 0 and age % 365 == 0))
                         and age not in fun["annv"]):
                     fun["annv"].append(age)
@@ -1868,9 +1869,6 @@ class Bot:
         fun["ranks"] = {name: i + 1 for i, (name, _) in enumerate(ranked)}
         fun["chat_today"] = {}
         state["day"] = key
-        emoji, title, _, _ = funstats.pick_challenge(key)
-        events_say(f"🎯  **Today's challenge:** {emoji} {title} — "
-                   f"winner crowned at 3:00 am Eastern.")
         return True
 
     def check_milestones(self, playtimes):
@@ -2000,8 +1998,18 @@ class Bot:
             upsert_embed(url, f"stat_{key}", state, embed)
         self.drop_unused_cards(url, "stat_", wanted)
 
+    def world_start(self):
+        """The date the world began: configured, or the oldest archived log."""
+        for value in (CFG["world_started"], self.fun["world_first_day"]):
+            if value:
+                try:
+                    return dt.date.fromisoformat(str(value))
+                except ValueError:
+                    continue
+        return None
+
     def motd_pairs(self, now):
-        """[(line1, line2)] for the server list — the facts worth advertising.
+        """[(line1, line2)] for the server list: the name and day, then a fact.
 
         MiniMOTD picks one entry at random per ping, so each fact is its own
         entry and every refresh of the server list shows a different one.
@@ -2019,11 +2027,12 @@ class Bot:
         except OSError:
             pass
         title = f"<gradient:#55ff88:#ffd75f><bold>{name}</bold></gradient>"
+        start = self.world_start()
+        if start:
+            day_number = (dt.date.fromtimestamp(now) - start).days
+            title += f"<gray> — <white>Day {day_number}</white></gray>"
 
         facts = []
-        if self.state["day"]:
-            _, challenge, _, _ = funstats.pick_challenge(self.state["day"])
-            facts.append(f"<yellow>today's challenge: <white>{challenge.lower()}")
         if fun["last_death"] and now - max(fun["last_death"].values()) >= 86400:
             quiet = int((now - max(fun["last_death"].values())) // 86400)
             facts.append(f"<green>{quiet} day{'s' if quiet != 1 else ''} death-free")
@@ -2031,20 +2040,35 @@ class Bot:
             deaths = sum(e.get("deaths", 0) for e in self.stats.values())
             if deaths:
                 facts.append(f"<red>{deaths:,} deaths <gray>and counting")
-        if fun["world_first_day"]:
-            age = (dt.date.fromtimestamp(now)
-                   - dt.date.fromisoformat(fun["world_first_day"])).days
-            facts.append(f"<gray>day <white>{age}</white> of the adventure")
         running = [(n, e["current"]) for n, e in fun["streaks"].items()
                    if e["current"] >= 2]
         if running:
             top, days = max(running, key=lambda kv: kv[1])
             facts.append(f"<light_purple>{top} is on a {days}-day streak")
         if fun["mvp"]:
-            facts.append(f"<gold>yesterday's MVP: {fun['mvp']}")
+            facts.append(f"<gold>yesterday's MVP: <white>{fun['mvp']}")
         hours = sum(e.get("play_time", 0) for e in self.stats.values()) / 3600
         if hours >= 1:
             facts.append(f"<green>{hours:,.0f} hours <gray>played together")
+        # Lifetime fun stats, straight off the save.
+        agg = funstats.aggregate(self.criteria, self.criterion_values)
+        totals = {key: sum(a.get(key, 0) for a in agg.values())
+                  for key in ("mined", "placed", "killed", "distance",
+                              "fish", "trades")}
+        diamonds = sum(sum(v.get(c, 0) for c in self.DIAMOND_CRITERIA)
+                       for v in self.criterion_values.values())
+        for value, line in (
+                (totals["mined"], f"<aqua>{totals['mined']:,.0f} <gray>blocks mined"),
+                (totals["placed"], f"<aqua>{totals['placed']:,.0f} <gray>blocks placed"),
+                (totals["killed"], f"<red>{totals['killed']:,.0f} <gray>mobs slain"),
+                (totals["distance"],
+                 f"<yellow>{totals['distance'] / 100_000:,.0f} km <gray>travelled"),
+                (diamonds, f"<blue>{diamonds:,.0f} <gray>diamond ore mined"),
+                (totals["fish"], f"<dark_aqua>{totals['fish']:,.0f} <gray>fish caught"),
+                (totals["trades"],
+                 f"<gold>{totals['trades']:,.0f} <gray>villager trades")):
+            if value:
+                facts.append(line)
         for key, _, label, _, _, unit in funstats.RECORDS:
             entry = fun["records"].get(key)
             if entry:
@@ -2053,7 +2077,7 @@ class Bot:
                              f"<gray>({entry['holder']})")
         if not facts:
             facts = ["<gray>a fine day for block games"]
-        return [(title, fact) for fact in facts[:8]]
+        return [(title, fact) for fact in facts[:12]]
 
     def refresh_motd(self, now):
         """Restock MiniMOTD's rotation and ask the server to re-read it.
@@ -2104,7 +2128,6 @@ class Bot:
         state = self.state
         scale = CFG["stats_noise_scale"]
         deltas = subtract(self.criterion_values, state["day_stat_baseline"])
-        agg = funstats.aggregate(self.criteria, deltas)
         playtimes = all_playtimes(self.stats, state, now)
         upsert_embed(url, "daily_overview", state,
                      daily_overview_embed(state, self.criteria, deltas,
@@ -2112,12 +2135,7 @@ class Bot:
         time.sleep(0.4)
         upsert_embed(url, "daily_playtime", state,
                      daily_playtime_embed(state, playtimes, now))
-        time.sleep(0.4)
-        upsert_embed(url, "daily_challenge", state,
-                     funstats.challenge_embed(
-                         funstats.pick_challenge(state["day"] or day_key(now)),
-                         agg, day_label(now)))
-        wanted = ["daily_overview", "daily_playtime", "daily_challenge"]
+        wanted = ["daily_overview", "daily_playtime"]
         for key, embed in gamestats.category_embeds(
                 self.criteria, deltas, top=CFG["daily_top_per_category"],
                 title_suffix="  ·  Today", scale=scale):

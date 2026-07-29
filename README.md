@@ -137,7 +137,6 @@ Placed and mined + placed also feed a 🧱 **Master Builder** daily award and tw
 on the single-day records ledger.
 - 📅 **Today's Playtime** — who has played today, seeded from the log archive when the
   watcher starts partway through a day
-- 🎯 **Today's Challenge** — live standings for the day's competition
 - one card per category, counted since 03:00
 
 Every statistic is tracked daily, not a subset: on a normal day here around **840** of
@@ -154,13 +153,10 @@ events channel as one post; without an events webhook it falls back to this chan
 **Events channel** (`webhook_events`) — the hype feed. Everything that is a *moment*
 rather than a standing card lands here:
 
-- 🎖️ the nightly recap bundle: yesterday's playtime and statistics, the **Daily
+- 🎖️ the nightly recap bundle: yesterday's playtime and statistics, and the **Daily
   Awards** (Most Dedicated, Menace to Wildlife, Butterfingers, Homebody, Punching Bag,
   Chatterbox…— each with a minimum so nobody wins an empty category, and flavor text
-  that is deterministic on the date so a restart never re-rolls it), and the challenge
-  result
-- 🎯 the new **challenge of the day** (mine the most, travel the furthest, catch the
-  most fish… — picked deterministically from the date)
+  that is deterministic on the date so a restart never re-rolls it)
 - 📜 **daily records broken** — "new best for blocks mined in a day", with the previous
   holder named
 - 🔥 **streak milestones** (3, 5, 7, 14… consecutive days) and 💔 broken streaks
@@ -256,11 +252,16 @@ off, so nothing breaks when it isn't available:
 ## The dynamic MOTD
 
 Vanilla reads `motd` from server.properties once at boot, so a changing MOTD needs the
-MiniMOTD mod. The bot keeps MiniMOTD's `motd` list stocked with live facts — today's
-challenge, days death-free, the world's age, the hottest streak, yesterday's MVP, the
-record book, total hours played together — and asks for `minimotd reload` over RCON.
-MiniMOTD shows a random entry per ping, so the server list becomes a tiny rotating
-dashboard.
+MiniMOTD mod. Line one is always the server's name and the day number — **BigBoys SMP —
+Day 12**, counted from `world_started` in config (July 17), since the log archive does
+not reach back that far. Line two is a rotating fun fact or stat: days death-free, the
+hottest streak, yesterday's MVP, hours played together, lifetime totals (blocks mined
+and placed, mobs slain, km travelled, diamond ore, fish, trades) and the record book.
+The bot restocks the list and asks for `minimotd reload` over RCON; MiniMOTD shows a
+random entry per ping, so the server list becomes a tiny rotating dashboard.
+
+The daily-challenge machinery still exists in `funstats.py` but nothing surfaces it —
+it was retired from the cards, the recap, and the MOTD.
 
 Only the `motd=[...]` list inside MiniMOTD's main.conf is rewritten (brackets are
 counted, everything else is preserved), the file is only touched when the facts change,

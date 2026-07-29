@@ -31,6 +31,7 @@
   "daily_card_seconds": 300,
   "daily_top_per_category": 10,
   "stats_noise_scale": 1.0,
+  "world_started": "",
 
   "main_events": false,
   "relay_chat": false,
