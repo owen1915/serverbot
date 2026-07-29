@@ -48,6 +48,9 @@ USER_AGENT = "mcbot/2.0 (local server watcher)"
 # cleared out and the new set is posted in the intended order.
 LAYOUT_VERSION = 6
 TICKS_PER_SECOND = 20
+# Bumped when the player-list header/footer template changes, so the style
+# file is rewritten even though the day number has not moved.
+TAB_STYLE_REV = 2
 
 # All-time playtime marks that earn a shout-out, in hours.
 MILESTONE_HOURS = [10, 25, 50, 100, 250, 500, 1000, 2000]
@@ -1868,13 +1871,18 @@ class Bot:
         else:
             value = agg.get(name, {}).get(source, 0)
         shown = fmt(value) if callable(fmt) else fmt.format(value)
-        parts = []
+        # Column order matters: the client anchors this text to the right,
+        # so the constant-width pieces (label, the h:mm clock in Minecraft's
+        # uniform-width digits) go rightmost and line up across rows, while
+        # the variable-width value absorbs the drift on the far left.
+        parts = [{"text": shown + " ", "color": color, "bold": True},
+                 {"text": label, "color": "gray"}]
         start = self.state["players"].get(name)
         if start is not None:
-            parts += [{"text": fmt_duration(time.time() - start), "color": "white"},
-                      {"text": "  ·  ", "color": "dark_gray"}]
-        parts += [{"text": shown + " ", "color": color, "bold": True},
-                  {"text": label, "color": "gray"}]
+            minutes = int(time.time() - start) // 60
+            parts += [{"text": "  ·  ", "color": "dark_gray"},
+                      {"text": f"{minutes // 60}:{minutes % 60:02d}",
+                       "color": "white"}]
         return [f"scoreboard players set {name} mcbot_tab {int(value)}",
                 f"scoreboard players display numberformat {name} "
                 f"mcbot_tab fixed {json.dumps(parts)}"]
@@ -2441,8 +2449,8 @@ class Bot:
                             "styles", "default.json")
         if not os.path.isfile(path):
             return
-        today = day_key(now)
-        if self.fun.get("tab_style_day") == today:
+        stamp = f"{day_key(now)}|{TAB_STYLE_REV}"
+        if self.fun.get("tab_style_day") == stamp:
             return
         start = self.world_start()
         day_number = (dt.date.fromtimestamp(now) - start).days if start else "?"
@@ -2453,6 +2461,7 @@ class Bot:
                 "",
                 f"<gr #55ff88 #ffd75f><bold> {self.server_name()} </bold></gr>"
                 f"<gray>| <white>Day {day_number}</white> ",
+                "",
                 f"<color #555555>[ </color><color #FF5555>%server:online%"
                 f"<color #666676>/</color>%server:max_players%</color>"
                 f"<color #555555> ]</color>",
@@ -2460,7 +2469,6 @@ class Bot:
             ],
             "list_footer": [
                 "",
-                "<gray>TPS %server:tps_colored% <dark_gray>|</dark_gray> "
                 "<gray>ping <color:#ffba26>%player:ping%</color> "
                 "<dark_gray>|</dark_gray> <green>owengoodman.com</green>",
                 "",
@@ -2475,7 +2483,7 @@ class Bot:
             return
         delivered = rcon.command(CFG["server_dir"], "styledplayerlist reload")
         if delivered is not None:
-            self.fun["tab_style_day"] = today
+            self.fun["tab_style_day"] = stamp
             log(f"[tab] header set to {self.server_name()} | Day {day_number}")
 
     def motd_pairs(self, now):
