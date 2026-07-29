@@ -272,6 +272,145 @@ def test_statistic_criteria():
           ["Warden"])
 
 
+def test_day_boundary():
+    """The statistics day turns over at 03:00 Eastern, summer and winter."""
+    import datetime as dt
+
+    def eastern(y, mo, d, h, mi=0):
+        """Epoch for a wall-clock Eastern moment, via the offset itself."""
+        naive = dt.datetime(y, mo, d, h, mi, tzinfo=dt.timezone.utc).timestamp()
+        return naive - mcbot.eastern_offset(naive)
+
+    check("winter is EST", mcbot.eastern_offset(eastern(2026, 1, 15, 12)), -5 * 3600)
+    check("summer is EDT", mcbot.eastern_offset(eastern(2026, 7, 15, 12)), -4 * 3600)
+    # 2026: DST starts Sunday 8 March, ends Sunday 1 November.
+    check("the day before the spring change is still EST",
+          mcbot.eastern_offset(eastern(2026, 3, 7, 12)), -5 * 3600)
+    check("the day after the spring change is EDT",
+          mcbot.eastern_offset(eastern(2026, 3, 9, 12)), -4 * 3600)
+    check("the day after the autumn change is EST",
+          mcbot.eastern_offset(eastern(2026, 11, 2, 12)), -5 * 3600)
+
+    check("02:59 still belongs to the previous day",
+          mcbot.day_key(eastern(2026, 7, 15, 2, 59)), "2026-07-14")
+    check("03:01 begins the new day",
+          mcbot.day_key(eastern(2026, 7, 15, 3, 1)), "2026-07-15")
+    check("midday belongs to that day",
+          mcbot.day_key(eastern(2026, 7, 15, 12)), "2026-07-15")
+    check("a winter night rolls over at 03:00 too",
+          mcbot.day_key(eastern(2026, 1, 15, 2, 59)), "2026-01-14")
+
+    noon = eastern(2026, 7, 15, 12)
+    check("the day began at 03:00 Eastern",
+          mcbot.eastern_clock(mcbot.day_start_epoch(noon)), "03:00")
+    check("the day is 24 hours long",
+          round((mcbot.day_start_epoch(noon + 86400)
+                 - mcbot.day_start_epoch(noon)) / 3600), 24)
+
+
+def test_noise_floor():
+    """Statistics somebody has barely touched must not earn a row."""
+    import gamestats
+    per_player = {
+        "ann": {"minecraft.picked_up:minecraft.iron_ingot": 1,
+                "minecraft.picked_up:minecraft.cobblestone": 4000,
+                "minecraft.killed_by:minecraft.warden": 1,
+                "minecraft.custom:minecraft.walk_one_cm": 500},
+    }
+    shown = [row[0] for row in gamestats.leaders(list(per_player["ann"]), per_player)]
+    check("one iron ingot picked up is hidden", "Iron Ingot" in shown, False)
+    check("four thousand cobblestone is shown", "Cobblestone" in shown, True)
+    check("a single death to a warden is still shown", "Warden" in shown, True)
+    check("five metres walked is hidden", "Walk" in shown, False)
+    check("the hidden statistics are counted, not dropped silently",
+          gamestats.below_floor(list(per_player["ann"]), per_player), 2)
+
+    # The scale knob moves the bar in both directions.
+    lowered = [row[0] for row in
+               gamestats.leaders(list(per_player["ann"]), per_player, scale=0.01)]
+    check("lowering the scale shows the small statistics again",
+          "Iron Ingot" in lowered, True)
+    # At scale 100 the picked-up floor is 3,200 — the cobblestone clears it and
+    # nothing else comes close.
+    raised = [row[0] for row in
+              gamestats.leaders(list(per_player["ann"]), per_player, scale=100)]
+    check("raising the scale hides all but the biggest", raised, ["Cobblestone"])
+
+
+def test_summary_totals():
+    """The glance card adds whole sections up, and drops what did not happen."""
+    import gamestats
+    criteria = ["minecraft.mined:minecraft.stone",
+                "minecraft.mined:minecraft.dirt",
+                "minecraft.custom:minecraft.deaths",
+                "minecraft.custom:minecraft.walk_one_cm",
+                "minecraft.custom:minecraft.sprint_one_cm",
+                "minecraft.custom:minecraft.fish_caught"]
+    per_player = {
+        "ann": {"minecraft.mined:minecraft.stone": 400,
+                "minecraft.custom:minecraft.deaths": 2,
+                "minecraft.custom:minecraft.walk_one_cm": 150_000},
+        "bob": {"minecraft.mined:minecraft.stone": 100,
+                "minecraft.mined:minecraft.dirt": 40,
+                "minecraft.custom:minecraft.sprint_one_cm": 250_000},
+    }
+    got = {label: value for _, label, value in
+           gamestats.summary_totals(criteria, per_player)}
+    check("a section is summed across items and players",
+          got.get("Blocks Mined"), "540")
+    check("deaths are counted", got.get("Deaths"), "2")
+    check("distance is summed across every way of moving",
+          got.get("Distance Travelled"), "4.0km")
+    check("a statistic nobody scored is left off the card",
+          "Fish Caught" in got, False)
+    check("totals ignore the noise floor, unlike table rows",
+          got.get("Blocks Mined") is not None, True)
+
+
+def test_chat_transcript():
+    """The chat channel repeats everything, whatever the main channel announces."""
+    bot = mcbot.Bot.__new__(mcbot.Bot)
+    bot.state = mcbot.new_state()
+    bot.stats = {}
+    bot.dirty = False
+    bot.perf = None
+
+    original_say, original_cfg = mcbot.say, dict(mcbot.CFG)
+    mcbot.say = lambda c: None
+    # Every announcement switch off: the transcript must not depend on them.
+    mcbot.CFG.update({"webhook_chat": "https://example.invalid/hook",
+                      "relay_chat": False, "announce_deaths": False,
+                      "announce_advancements": False, "main_events": False})
+    del mcbot._chat_queue[:]
+    try:
+        for message in [
+            "owen1915 joined the game",
+            "<owen1915> hello everyone",
+            "owen1915 has made the advancement [Diamonds!]",
+            "owen1915 was blown up by Creeper",
+            "[voicechat] Sent secret to owen1915",
+            "owen1915 left the game",
+        ]:
+            bot.handle(message, 1000.0)
+        queued = list(mcbot._chat_queue)
+    finally:
+        mcbot.say = original_say
+        mcbot.CFG.clear()
+        mcbot.CFG.update(original_cfg)
+        del mcbot._chat_queue[:]
+
+    def count(fragment):
+        return sum(fragment in line for line in queued)
+
+    check("join mirrored", count("joined the game"), 1)
+    check("chat mirrored even with relay_chat off", count("hello everyone"), 1)
+    check("advancement mirrored with announcements off", count("Diamonds!"), 1)
+    check("death mirrored with announcements off", count("blown up by Creeper"), 1)
+    check("server internals stay out of the transcript", count("voicechat"), 0)
+    check("leave mirrored", count("left the game"), 1)
+    check("nothing else was queued", len(queued), 5)
+
+
 def main():
     test_reader()
     print()
@@ -286,6 +425,14 @@ def main():
     test_weekly_statistic_deltas()
     print()
     test_statistic_criteria()
+    print()
+    test_day_boundary()
+    print()
+    test_noise_floor()
+    print()
+    test_summary_totals()
+    print()
+    test_chat_transcript()
     print()
     if failures:
         print(f"{len(failures)} FAILED: {', '.join(failures)}")

@@ -3,12 +3,15 @@
   "host": "127.0.0.1",
   "port": 25565,
   "public_address": "your.public.ip.or.host:25565",
+  "check_address": "",
 
   "webhook_main": "https://discord.com/api/webhooks/.../...",
   "webhook_weekly": "https://discord.com/api/webhooks/.../...",
   "webhook_logs": "https://discord.com/api/webhooks/.../...",
   "webhook_perf": "https://discord.com/api/webhooks/.../...",
   "webhook_stats": "https://discord.com/api/webhooks/.../...",
+  "webhook_daily": "https://discord.com/api/webhooks/.../...",
+  "webhook_chat": "https://discord.com/api/webhooks/.../...",
 
   "down_mention": "@everyone",
   "down_after_seconds": 90,
@@ -23,7 +26,10 @@
   "daily_report": true,
 
   "stats_card_seconds": 900,
-  "stats_top_per_category": 0,
+  "stats_top_per_category": 10,
+  "daily_card_seconds": 300,
+  "daily_top_per_category": 10,
+  "stats_noise_scale": 1.0,
 
   "main_events": false,
   "relay_chat": false,

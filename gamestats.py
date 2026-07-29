@@ -227,6 +227,58 @@ def format_value(criterion, value):
     return f"{int(value):,}"
 
 
+# ------------------------------------------------------------- noise floor --
+
+# The save records every statistic a player has touched even once, so without a
+# floor the cards fill up with "1 iron ingot picked up" and bury the figures
+# worth reading. Each category gets the floor that suits how often it ticks:
+# picking things up is the noisiest thing a player does, while dying to a
+# warden is worth showing the very first time it happens.
+SECTION_FLOOR = {
+    "minecraft:mined": 16,       # a stack; below that it is incidental digging
+    "minecraft:picked_up": 32,   # ticks constantly, on its own and from others
+    "minecraft:dropped": 16,
+    "minecraft:used": 10,
+    "minecraft:crafted": 8,
+    "minecraft:killed": 5,
+    "minecraft:killed_by": 1,    # deaths are rare and always tell a story
+    "minecraft:broken": 1,       # wearing a tool out takes real time
+}
+DEFAULT_SECTION_FLOOR = 5
+
+# Custom statistics are counted in their own units, so their floors are too.
+UNIT_FLOOR = {
+    "count": 5,
+    "distance": 100_000,    # one kilometre, in centimetres
+    "time": 20 * 60 * 5,    # five minutes, in ticks
+    "damage": 100,          # ten damage, in tenths
+}
+
+
+def noise_floor(criterion, scale=1.0):
+    """The smallest value worth giving a row to, for one statistic."""
+    parts = split_criterion(criterion)
+    if not parts:
+        return 1
+    section = parts[0]
+    if section == "minecraft:custom":
+        base = UNIT_FLOOR.get(unit_of(criterion), UNIT_FLOOR["count"])
+    else:
+        base = SECTION_FLOOR.get(section, DEFAULT_SECTION_FLOOR)
+    return max(1, int(base * scale))
+
+
+def below_floor(criteria, per_player, scale=1.0):
+    """How many statistics were recorded but are too small to show."""
+    hidden = 0
+    for criterion in criteria:
+        best = max((values.get(criterion, 0) for values in per_player.values()),
+                   default=0)
+        if 0 < best < noise_floor(criterion, scale):
+            hidden += 1
+    return hidden
+
+
 # Discord renders ANSI escapes inside ```ansi blocks; this is the only way to
 # get both aligned columns and colour in a message.
 RESET = "[0m"
@@ -265,12 +317,18 @@ def table(rows, subject_header, value_header):
     return "```ansi\n" + "\n".join(out) + "\n```"
 
 
-def leaders(criteria, per_player, minimum=1):
-    """[(label, leader, formatted value, total)] for criteria anyone has scored."""
+def leaders(criteria, per_player, scale=1.0):
+    """[(label, leader, formatted value, total)] for criteria worth showing.
+
+    A player only counts towards a statistic once they are past its noise
+    floor, so a row appears when somebody has genuinely done the thing rather
+    than brushed against it once.
+    """
     rows = []
     for criterion in criteria:
+        floor = noise_floor(criterion, scale)
         scores = {name: values.get(criterion, 0) for name, values in per_player.items()}
-        scores = {n: v for n, v in scores.items() if v >= minimum}
+        scores = {n: v for n, v in scores.items() if v >= floor}
         if not scores:
             continue
         leader = max(scores, key=lambda n: scores[n])
@@ -292,7 +350,8 @@ def untouched(criteria, per_player):
     return out
 
 
-def category_embeds(criteria, per_player, curated=(), top=0, title_suffix=""):
+def category_embeds(criteria, per_player, curated=(), top=0, title_suffix="",
+                    scale=1.0, skip_empty=False):
     """One embed per category, in CATEGORIES order.
 
     Categories with more rows than fit in a description are split across
@@ -318,9 +377,15 @@ def category_embeds(criteria, per_player, curated=(), top=0, title_suffix=""):
         mine = [c for section in sections for c in by_section.get(section, [])]
         if not mine:
             continue
-        rows = scored = leaders(mine, per_player)
+        rows = scored = leaders(mine, per_player, scale)
+        # A board that counts a single day starts every day with nothing in
+        # most categories, and a row of "nothing recorded yet" cards is worse
+        # than no card at all.
+        if skip_empty and not rows:
+            continue
         if top:
             rows = rows[:top]
+        hidden = below_floor(mine, per_player, scale)
         missing = untouched(
             [c for section in sections for c in curated_by_section.get(section, [])],
             per_player)
@@ -343,29 +408,34 @@ def category_embeds(criteria, per_player, curated=(), top=0, title_suffix=""):
                 more = f" *…and {len(missing) - 24} more*" if len(missing) > 24 else ""
                 description += f"\n**Not yet recorded ({len(missing)}):** {shown}{more}"
             suffix = f"  ({index + 1}/{len(pages)})" if len(pages) > 1 else ""
+            # Say what was left out rather than quietly truncating: a card that
+            # shows 40 of 300 statistics should not read as the whole picture.
+            counted = (f"{len(rows)} of {len(scored)}" if len(rows) != len(scored)
+                       else f"{len(scored)}") + " shown"
+            if hidden:
+                counted += f"  •  {hidden} too small to list"
             embeds.append((f"{key}{index if index else ''}", {
                 "title": f"{emoji}  {title}{title_suffix}{suffix}",
                 "description": description[:4096],
                 "color": CATEGORY_COLOURS.get(key, 0x5865F2),
-                "footer": {"text": (f"{len(rows)} of {len(scored)} recorded"
-                                    if len(rows) != len(scored)
-                                    else f"{len(scored)} recorded")
-                                   + "  •  leader shown  •  updated"},
+                "footer": {"text": counted + "  •  leader shown  •  updated"},
             }))
     return embeds
 
 
-def overview_embed(criteria, per_player, players_tracked):
+def overview_embed(criteria, per_player, players_tracked, scale=1.0):
     """A summary card: how much is tracked, and who leads the most of it."""
+    rows = leaders(criteria, per_player, scale)
     wins = {}
-    for row in leaders(criteria, per_player):
+    for row in rows:
         wins[row[1]] = wins.get(row[1], 0) + 1
     ranked = sorted(wins.items(), key=lambda kv: -kv[1])
     medals = ["🥇", "🥈", "🥉"]
     lines = [f"> {medals[i] if i < 3 else f'`{i + 1}.`'}  **{name}** — "
              f"leads **{count}** statistic{'s' if count != 1 else ''}"
              for i, (name, count) in enumerate(ranked[:10])]
-    recorded = len(leaders(criteria, per_player))
+    recorded = len(rows)
+    hidden = below_floor(criteria, per_player, scale)
     by_section = {}
     for criterion in criteria:
         parts = split_criterion(criterion)
@@ -375,20 +445,80 @@ def overview_embed(criteria, per_player, players_tracked):
         f"**{by_section.get(section, 0)}** {title.lower()}"
         for _, _, title, _, _, sections in CATEGORIES
         for section in sections[:1] if by_section.get(section))
+    small = (f"  {hidden:,} more are too small to list.") if hidden else ""
     return {
         "title": "🏛️  Hall of Fame",
         "description": (f"### Who leads the most statistics\n"
                         + ("\n".join(lines) if lines
                            else "> 💤  *nothing recorded yet*")
                         + f"\n\n**{recorded:,}** statistics recorded across "
-                          f"**{players_tracked}** players.\n> {breakdown}"),
+                          f"**{players_tracked}** players.{small}\n> {breakdown}"),
         "color": 0xFFD700,
         "footer": {"text": "all-time  •  every statistic in the world save  •  updated"},
     }
 
 
-def weekly_embed(criteria, deltas, label):
-    """A single card of what actually moved this week, best categories first."""
+# Headline figures for a summary card: a whole section added up, or one custom
+# statistic on its own. A table shows the top ten of one category; these are the
+# numbers that say what the whole server did, and they need no floor because
+# they are totals rather than a row per item.
+SUMMARY_SECTIONS = [
+    ("⛏️", "Blocks Mined", "minecraft:mined"),
+    ("⚒️", "Items Crafted", "minecraft:crafted"),
+    ("🗡️", "Mobs Killed", "minecraft:killed"),
+    ("🧪", "Items Used", "minecraft:used"),
+    ("🎒", "Items Picked Up", "minecraft:picked_up"),
+    ("📤", "Items Dropped", "minecraft:dropped"),
+]
+SUMMARY_CUSTOM = [
+    ("💀", "Deaths", "minecraft:deaths"),
+    ("⚔️", "Damage Dealt", "minecraft:damage_dealt"),
+    ("💔", "Damage Taken", "minecraft:damage_taken"),
+    ("🦘", "Jumps", "minecraft:jump"),
+    ("🐟", "Fish Caught", "minecraft:fish_caught"),
+    ("🐄", "Animals Bred", "minecraft:animals_bred"),
+    ("💰", "Villager Trades", "minecraft:traded_with_villager"),
+    ("🛏️", "Nights Slept", "minecraft:sleep_in_bed"),
+    ("🏰", "Raids Won", "minecraft:raid_win"),
+    ("📦", "Chests Opened", "minecraft:open_chest"),
+]
+
+
+def summary_totals(criteria, per_player):
+    """[(emoji, label, formatted)] — the headline figures, zeros dropped."""
+    by_section = {}
+    for criterion in criteria:
+        parts = split_criterion(criterion)
+        if parts:
+            by_section.setdefault(parts[0], []).append(criterion)
+
+    def total(subset):
+        return sum(values.get(c, 0)
+                   for c in subset for values in per_player.values())
+
+    out = []
+    for emoji, label, section in SUMMARY_SECTIONS:
+        value = total(by_section.get(section, []))
+        if value:
+            out.append((emoji, label, f"{int(value):,}"))
+    # Distance is spread over a dozen criteria — walking, sprinting, boating,
+    # falling — and is only meaningful added up.
+    travelled = [c for c in by_section.get("minecraft:custom", [])
+                 if unit_of(c) == "distance"]
+    walked = total(travelled)
+    if walked:
+        out.append(("🏃", "Distance Travelled", format_value(travelled[0], walked)))
+    for emoji, label, key in SUMMARY_CUSTOM:
+        criterion = criterion_for("minecraft:custom", key)
+        value = total([criterion])
+        if value:
+            out.append((emoji, label, format_value(criterion, value)))
+    return out
+
+
+def period_embed(criteria, deltas, title, label, colour, footer, scale=1.0,
+                 empty="nothing recorded yet"):
+    """A single card of what actually moved over a period, best first."""
     sections = []
     by_section = {}
     for criterion in criteria:
@@ -396,22 +526,29 @@ def weekly_embed(criteria, deltas, label):
         if parts:
             by_section.setdefault(parts[0], []).append(criterion)
 
-    for key, emoji, title, _, _, wanted in CATEGORIES:
+    for key, emoji, heading, _, _, wanted in CATEGORIES:
         mine = [c for section in wanted for c in by_section.get(section, [])]
-        rows = leaders(mine, deltas)
+        rows = leaders(mine, deltas, scale)
         if not rows:
             continue
         top = rows[:6]
         body = "\n".join(f"> {emoji if i == 0 else '　'}  {label_}  ·  "
                          f"**{leader}** {shown}"
                          for i, (label_, leader, shown, _, _) in enumerate(top))
-        sections.append(f"**{title}**\n{body}")
+        sections.append(f"**{heading}**\n{body}")
 
     description = f"### {label}\n" + (
-        "\n".join(sections) if sections else "> 💤  *nothing recorded this week yet*")
+        "\n".join(sections) if sections else f"> 💤  *{empty}*")
     return {
-        "title": "📈  This Week's Statistics",
+        "title": title,
         "description": description[:4096],
-        "color": 0x2ECC71,
-        "footer": {"text": "resets Monday  •  change since the week began"},
+        "color": colour,
+        "footer": {"text": footer},
     }
+
+
+def weekly_embed(criteria, deltas, label, scale=1.0):
+    """What moved this week, for the leaderboard channel."""
+    return period_embed(criteria, deltas, "📈  This Week's Statistics", label,
+                        0x2ECC71, "resets Monday  •  change since the week began",
+                        scale, empty="nothing recorded this week yet")

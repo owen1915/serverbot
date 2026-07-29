@@ -42,7 +42,7 @@ LOG_FILE = os.path.join(HERE, "mcbot.log")
 USER_AGENT = "mcbot/2.0 (local server watcher)"
 # Bumped when the set of cards in a channel changes, so the old ones are
 # cleared out and the new set is posted in the intended order.
-LAYOUT_VERSION = 3
+LAYOUT_VERSION = 4
 TICKS_PER_SECOND = 20
 
 # All-time playtime marks that earn a shout-out, in hours.
@@ -56,13 +56,21 @@ DEFAULTS = {
     # Address to ping for live status. Localhost — this runs on the server.
     "host": "127.0.0.1",
     "port": 25565,
-    # Public address, used only for display and the reachability check.
+    # Public address, used for display: this is what players type.
     "public_address": "",
+    # What the reachability check actually pings. Defaults to public_address.
+    # Set it when public_address is a domain that players reach through a
+    # Minecraft SRV record: the client follows those, this bot does not, and
+    # the apex record often points somewhere else entirely (a web host, or
+    # Cloudflare, which does not carry Minecraft traffic).
+    "check_address": "",
     "webhook_main": "",     # status card + join/leave/death/advancement events
     "webhook_weekly": "",   # weekly + all-time + statistics leaderboards
     "webhook_logs": "",     # mirror of this bot's own log lines
     "webhook_perf": "",     # performance card, outage records, daily report
     "webhook_stats": "",    # every tracked statistic, all-time, by category
+    "webhook_daily": "",    # today's statistics, reset at 03:00 Eastern
+    "webhook_chat": "",     # every chat line, join, leave, death, advancement
     # Post join/leave/death/advancement/record/up-down messages to the main
     # channel. Off by default: that channel holds the status card and nothing
     # else, so the card stays put and never has to be re-posted.
@@ -90,10 +98,17 @@ DEFAULTS = {
     "leaderboard_refresh_seconds": 600,
     # The all-time statistic cards are large and move slowly.
     "stats_card_seconds": 900,
-    # Cap rows per statistic category; 0 shows every recorded statistic. The
-    # save holds a couple of thousand, which is a lot of cards — set this to
-    # something like 40 to keep the channel to the headline figures.
-    "stats_top_per_category": 0,
+    # Today's statistics move faster and there are far fewer of them.
+    "daily_card_seconds": 300,
+    # Cap rows per statistic category; 0 shows every recorded statistic, which
+    # is a couple of thousand rows and a whole channel of cards. Ten keeps each
+    # category to one card of headline figures.
+    "stats_top_per_category": 10,
+    "daily_top_per_category": 10,
+    # How high the bar is for a statistic to earn a row at all. 1.0 uses the
+    # per-category floors in gamestats.py — enough to keep "1 iron ingot picked
+    # up" out. Raise it for only the big numbers, lower it to show more.
+    "stats_noise_scale": 1.0,
     # Performance monitoring.
     "perf_sample_seconds": 30,
     "perf_card_seconds": 120,
@@ -153,7 +168,14 @@ def log(message, mirror=False):
     line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}"
     # Under pythonw.exe there is no console and sys.stdout is None.
     if sys.stdout is not None:
-        print(line, flush=True)
+        try:
+            print(line, flush=True)
+        except UnicodeEncodeError:
+            # A Windows console is usually cp1252, which cannot hold the emoji
+            # in card titles or the characters players type in chat. Losing a
+            # character from the console is fine; crashing the watcher is not.
+            encoding = sys.stdout.encoding or "ascii"
+            print(line.encode(encoding, "replace").decode(encoding), flush=True)
     try:
         _rotate_log()
         with open(LOG_FILE, "a", encoding="utf-8") as f:
@@ -216,6 +238,56 @@ def say(content):
         log(f"[error] could not post to main channel: {e}")
 
 
+_chat_queue = []
+CHAT_BATCH_CHARS = 1900  # Discord allows 2000; leave room for the join
+
+
+def chat_say(line):
+    """Queue one line for the chat-history channel.
+
+    This channel is a transcript, not an announcement feed: it carries every
+    chat message, join, leave, death and advancement regardless of what the
+    main channel is configured to announce.
+    """
+    if CFG["webhook_chat"]:
+        _chat_queue.append(line)
+
+
+def flush_chat():
+    """Post everything queued for the chat-history channel, oldest first.
+
+    Lines are batched because a busy server produces them faster than a webhook
+    will accept messages — one message per cycle stays inside the rate limit
+    and keeps the transcript in order.
+    """
+    global _chat_queue
+    if not _chat_queue:
+        return
+    pending, _chat_queue = _chat_queue, []
+    if DRY_RUN:
+        for line in pending:
+            log(f"[dry-run][chat] {line}")
+        return
+    while pending:
+        batch, size = [], 0
+        while pending and size + len(pending[0]) + 1 <= CHAT_BATCH_CHARS:
+            size += len(pending[0]) + 1
+            batch.append(pending.pop(0))
+        if not batch:  # a single line longer than a whole message
+            batch = [pending.pop(0)[:CHAT_BATCH_CHARS]]
+        try:
+            discord(CFG["webhook_chat"], "POST", {
+                "content": "\n".join(batch),
+                "username": "MC Chat",
+                # A transcript repeats whatever players typed, so it must never
+                # be able to ping anybody.
+                "allowed_mentions": {"parse": []},
+            })
+        except (urllib.error.URLError, OSError) as e:
+            log(f"[error] could not post to the chat channel: {e}")
+            return
+
+
 def perf_say(content):
     """Post to the performance channel. Never pings anybody."""
     if not CFG["webhook_perf"]:
@@ -238,6 +310,8 @@ def webhook_for(card):
     """Which channel a card belongs to, by its state key."""
     if card.startswith("stat_"):
         return CFG["webhook_stats"]
+    if card.startswith("daily_"):
+        return CFG["webhook_daily"]
     return {
         "status": CFG["webhook_main"],
         "perf": CFG["webhook_perf"],
@@ -250,6 +324,11 @@ def webhook_for(card):
 
 def _delete_message(url, mid):
     """True if the message is gone (deleted now, or already absent)."""
+    if DRY_RUN:
+        # A dry run must not touch a channel. Guarded here rather than at each
+        # call site, so no path can delete a real card by accident.
+        log(f"[dry-run] would delete message {mid}")
+        return True
     try:
         discord(f"{url}/messages/{mid}", "DELETE")
         return True
@@ -717,6 +796,61 @@ def week_start_epoch(now):
     return dt.datetime.combine(monday, dt.time.min).timestamp()
 
 
+# ------------------------------------------------------- the statistics day --
+
+# The daily board turns over at 03:00 Eastern rather than at midnight, so a
+# late-night session stays on the day it felt like it belonged to.
+DAY_RESET_HOUR = 3
+
+
+def _nth_weekday(year, month, weekday, n):
+    """The nth given weekday of a month, e.g. the second Sunday in March."""
+    first = dt.date(year, month, 1)
+    return first + dt.timedelta(days=(weekday - first.weekday()) % 7 + 7 * (n - 1))
+
+
+def eastern_offset(epoch):
+    """US Eastern's offset from UTC in seconds: -4h in summer, -5h in winter.
+
+    zoneinfo needs the separate tzdata package, which a stock Windows Python
+    does not have, so the rule is spelled out here instead: daylight time runs
+    from 07:00 UTC on the second Sunday in March to 06:00 UTC on the first
+    Sunday in November. That has been the US rule since 2007.
+    """
+    year = time.gmtime(epoch).tm_year
+    starts = dt.datetime.combine(_nth_weekday(year, 3, 6, 2), dt.time(7),
+                                 dt.timezone.utc).timestamp()
+    ends = dt.datetime.combine(_nth_weekday(year, 11, 6, 1), dt.time(6),
+                               dt.timezone.utc).timestamp()
+    return -4 * 3600 if starts <= epoch < ends else -5 * 3600
+
+
+def stat_day(epoch):
+    """The date the daily board is counting at this moment."""
+    shifted = epoch + eastern_offset(epoch) - DAY_RESET_HOUR * 3600
+    return dt.datetime.fromtimestamp(shifted, dt.timezone.utc).date()
+
+
+def day_key(epoch):
+    return stat_day(epoch).isoformat()
+
+
+def day_label(epoch):
+    return stat_day(epoch).strftime("%A, %b %d")
+
+
+def day_start_epoch(epoch):
+    """When the current statistics day began: 03:00 Eastern on that date."""
+    boundary = dt.datetime.combine(stat_day(epoch), dt.time(DAY_RESET_HOUR),
+                                   dt.timezone.utc).timestamp()
+    return boundary - eastern_offset(epoch)
+
+
+def eastern_clock(epoch):
+    """'02:41' — the Eastern wall clock, for footers that quote the reset."""
+    return time.strftime("%H:%M", time.gmtime(epoch + eastern_offset(epoch)))
+
+
 # ------------------------------------------------------------- formatting --
 
 def fmt_duration(seconds):
@@ -840,6 +974,65 @@ def weekly_embed(state, playtimes, now, final=False):
     }
 
 
+DAY_FOOTER = "resets at 3:00 am Eastern  •  from the server's own play_time"
+
+
+def daily_playtime_embed(state, playtimes, now, final=False):
+    """Who played today, counted from the 03:00 Eastern baseline."""
+    base = state["day_playtime_baseline"]
+    pairs = [(n, max(0, t - base.get(n, t))) for n, t in playtimes.items()]
+    return {
+        "title": "🌅  Yesterday's Playtime" if final else "📅  Today's Playtime",
+        "description": f"### {day_label(now - 86400 if final else now)}\n"
+                       + rank_lines(pairs, fmt_duration,
+                                    empty="*nobody has played today yet*"),
+        "color": 0xE67E22,
+        "footer": {"text": DAY_FOOTER},
+        "timestamp": now_iso(),
+    }
+
+
+def daily_overview_embed(state, criteria, deltas, playtimes, now):
+    """Today at a glance: what the whole server did, and who is ahead.
+
+    The category tables below this card show ten rows each; this one is where
+    the breadth lives — every headline total, and how much moved at all.
+    """
+    base = state["day_playtime_baseline"]
+    played = {n: max(0, t - base.get(n, t)) for n, t in playtimes.items()}
+    active = [n for n, seconds in played.items() if seconds > 0]
+
+    tiles = gamestats.summary_totals(criteria, deltas)
+    totals = "\n".join(f"> {emoji}  **{value}**  ·  {label}"
+                       for emoji, label, value in tiles)
+
+    rows = gamestats.leaders(criteria, deltas, CFG["stats_noise_scale"])
+    wins = {}
+    for row in rows:
+        wins[row[1]] = wins.get(row[1], 0) + 1
+    ranked = sorted(wins.items(), key=lambda kv: -kv[1])[:5]
+    ahead = "\n".join(
+        f"> {MEDALS[i] if i < 3 else f'`{i + 1}.`'}  **{name}** — "
+        f"leads **{count}** of today's statistics"
+        for i, (name, count) in enumerate(ranked))
+
+    if not tiles and not ranked:
+        description = f"### {day_label(now)}\n> 💤  *nothing recorded today yet*"
+    else:
+        description = (f"### {day_label(now)}\n"
+                       + (f"**Today's totals**\n{totals}\n" if totals else "")
+                       + (f"\n**Leading today**\n{ahead}\n" if ahead else "")
+                       + f"\n**{len(rows):,}** statistics moved today, across "
+                         f"**{len(active)}** player{'s' if len(active) != 1 else ''}.")
+    return {
+        "title": "🌞  Today at a Glance",
+        "description": description[:4096],
+        "color": 0xF39C12,
+        "footer": {"text": DAY_FOOTER},
+        "timestamp": now_iso(),
+    }
+
+
 def alltime_embed(playtimes):
     return {
         "title": "👑  All-Time Hours",
@@ -861,6 +1054,10 @@ def new_state():
         "week": None,
         "week_baseline": {},       # name -> all-time seconds at week start
         "stat_baseline": {},       # name -> {criterion: value} at week start
+        "day": None,               # the statistics day, rolling at 03:00 Eastern
+        "day_playtime_baseline": {},  # name -> all-time seconds at 03:00
+        "day_stat_baseline": {},   # name -> {criterion: value} at 03:00
+        "daily_layout": [],        # the daily channel's cards, in channel order
         "msg": {},                 # card name -> Discord message id
         "msg_stale": {},           # card name -> ids still to be cleaned up
         "record_players": 0,
@@ -911,6 +1108,7 @@ class Bot:
         self.last_perf_sample = 0.0
         self.last_perf_card = 0.0
         self.last_stat_cards = 0.0
+        self.last_daily_cards = 0.0
         self.status = None
         # The datapacks' objectives are a curated goal list, used to say which
         # goals are still unmet. What gets *shown* comes from the save itself,
@@ -969,11 +1167,13 @@ class Bot:
         # Statistic cards gain and lose pages as categories grow, and new pages
         # would otherwise land at the bottom of the channel instead of after
         # the category they belong to.
-        for key in [k for k in list(self.state["msg"]) if k.startswith("stat_")]:
+        for key in [k for k in list(self.state["msg"])
+                    if k.startswith("stat_") or k.startswith("daily_")]:
             mid = self.state["msg"].pop(key)
-            if mid and CFG["webhook_stats"]:
+            url = webhook_for(key)
+            if mid and url:
                 time.sleep(0.3)
-                _delete_message(CFG["webhook_stats"], mid)
+                _delete_message(url, mid)
         self.state["layout"] = LAYOUT_VERSION
         log("[card] re-laid out the leaderboard and statistics channels",
             mirror=True)
@@ -1030,6 +1230,7 @@ class Bot:
             count = len(state["players"])
             total = live_playtime(self.stats, state, name, now)
             extra = f" — {fmt_duration(total)} all-time" if total >= 60 else " — first time here! 👋"
+            chat_say(f"➡️  **{name}** joined the game  ·  *{count} online*")
             say(f":arrow_right: **{name}** joined the server ({count} online){extra}")
             self.dirty = True
             self.check_record(count)
@@ -1042,6 +1243,8 @@ class Bot:
             state["play_time_at_join"].pop(name, None)
             count = len(state["players"])
             played = fmt_duration(now - start) if start else "an unknown time"
+            chat_say(f"⬅️  **{name}** left the game  ·  *on for {played}, "
+                     f"{count} online*")
             say(f":arrow_left: **{name}** left the server ({count} online) "
                 f"— was on for **{played}**")
             self.dirty = True
@@ -1050,6 +1253,7 @@ class Bot:
         if START_RE.match(msg):
             state["server_start"] = now
             state["players"] = {}
+            chat_say("🟢  *the server finished starting up*")
             if state["online"] is False:
                 say(f":green_circle: **Server UP** — `{CFG['public_address'] or CFG['host']}` "
                     f"is back online.")
@@ -1060,6 +1264,7 @@ class Bot:
 
         if STOP_RE.match(msg):
             log("[event] server is stopping", mirror=True)
+            chat_say("🔴  *the server is shutting down*")
             state["players"] = {}
             self.dirty = True
             return
@@ -1074,25 +1279,28 @@ class Bot:
             return
 
         m = ADV_RE.match(msg)
-        if m and CFG["announce_advancements"]:
+        if m:
             name, adv = m.group(1), m.group(2)
-            if name in state["players"]:
+            chat_say(f"🏅  **{name}** earned the advancement **[{adv}]**")
+            if CFG["announce_advancements"] and name in state["players"]:
                 say(f":medal: **{name}** earned the advancement **[{adv}]**")
                 self.dirty = True
             return
 
         m = CHAT_RE.match(msg)
         if m:
+            chat_say(f"💬  **{m.group(1)}**: {m.group(2)[:1500]}")
             if CFG["relay_chat"]:
                 say(f"💬  **{m.group(1)}**: {m.group(2)[:1500]}")
             return
 
         # Anything else that starts with the name of somebody currently online
         # and is not a known non-death line is a death message.
-        if CFG["announce_deaths"]:
-            first = msg.split(" ", 1)[0]
-            if (first in self.state["players"] and not NOT_DEATH_RE.match(msg)
-                    and len(msg) > len(first) + 1):
+        first = msg.split(" ", 1)[0]
+        if (first in state["players"] and not NOT_DEATH_RE.match(msg)
+                and len(msg) > len(first) + 1):
+            chat_say(f"💀  {msg}")
+            if CFG["announce_deaths"]:
                 say(f":skull: {msg}")
                 self.dirty = True
 
@@ -1140,9 +1348,10 @@ class Bot:
     def do_external_check(self):
         """Confirm the server is reachable from outside, not just on localhost."""
         address = CFG["public_address"]
-        if not address:
+        probe = CFG["check_address"] or address
+        if not probe:
             return
-        host, _, port = address.partition(":")
+        host, _, port = probe.partition(":")
         reachable = ping_server(host, int(port) if port else 25565, timeout=8) is not None
         was = self.state["external_ok"]
         self.state["external_ok"] = reachable
@@ -1227,6 +1436,51 @@ class Bot:
         state["msg"].pop("weekly", None)
         return True
 
+    def roll_day(self, playtimes, now):
+        """Post the day's recap and reset the daily baselines at 03:00 Eastern."""
+        state = self.state
+        key = day_key(now)
+        if state["day"] == key:
+            return False
+        first_run = state["day"] is None
+        if not first_run and state["day_playtime_baseline"] and CFG["webhook_daily"]:
+            recap = [
+                daily_playtime_embed(state, playtimes, now, final=True),
+                gamestats.period_embed(
+                    self.criteria,
+                    subtract(self.criterion_values, state["day_stat_baseline"]),
+                    "🌙  Yesterday's Statistics", day_label(now - 86400),
+                    0xE67E22, "the day that just ended  •  resets at 3:00 am Eastern",
+                    CFG["stats_noise_scale"],
+                    empty="nothing was recorded yesterday"),
+            ]
+            if DRY_RUN:
+                log("[dry-run] daily recap")
+            else:
+                try:
+                    discord(CFG["webhook_daily"], "POST",
+                            {"username": "MC Server", "embeds": recap})
+                    log(f"[daily] posted the recap for {state['day']}", mirror=True)
+                except (urllib.error.URLError, OSError) as e:
+                    log(f"[error] daily recap post failed: {e}")
+        if first_run:
+            # Starting partway through a day: recover the playtime already
+            # earned since 03:00 from the log archive, the same way the weekly
+            # board is seeded, so the card is not blank until tomorrow.
+            played = playtime_since(day_start_epoch(now))
+            state["day_playtime_baseline"] = {n: max(0, t - played.get(n, 0))
+                                              for n, t in playtimes.items()}
+            log(f"[daily] seeded today from the logs: "
+                f"{ {n: fmt_duration(s) for n, s in played.items()} }")
+        else:
+            state["day_playtime_baseline"] = dict(playtimes)
+        # Statistics have no log archive to recover from, so today's counts
+        # necessarily start from wherever they stand right now.
+        state["day_stat_baseline"] = {n: dict(v)
+                                      for n, v in self.criterion_values.items()}
+        state["day"] = key
+        return True
+
     def check_milestones(self, playtimes):
         state = self.state
         if not state["milestones_initialised"]:
@@ -1281,8 +1535,26 @@ class Bot:
                      gamestats.weekly_embed(
                          self.criteria,
                          subtract(self.criterion_values, state["stat_baseline"]),
-                         week_label(now)),
+                         week_label(now), CFG["stats_noise_scale"]),
                      reposition=rolled)
+
+    def do_daily(self, now):
+        """Roll the statistics day at 03:00 Eastern, and keep today's cards fresh."""
+        if not CFG["webhook_daily"]:
+            return
+        state = self.state
+        playtimes = all_playtimes(self.stats, state, now)
+        rolled = self.roll_day(playtimes, now)
+        # Seed anybody the baselines have not seen, so a player who first
+        # appears mid-day is credited today's activity and not their lifetime.
+        for name, seconds in playtimes.items():
+            state["day_playtime_baseline"].setdefault(name, seconds)
+        for name, values in self.criterion_values.items():
+            state["day_stat_baseline"].setdefault(name, dict(values))
+        if rolled or now - self.last_daily_cards >= CFG["daily_card_seconds"]:
+            self.last_daily_cards = now
+            self.refresh_daily_cards(now, rolled=rolled)
+            save_state(state)
 
     def refresh_stat_cards(self):
         """The all-time statistic channel: an overview plus one card a category."""
@@ -1290,28 +1562,71 @@ class Bot:
         if not url or not self.criteria:
             return
         state = self.state
+        scale = CFG["stats_noise_scale"]
         wanted = ["stat_overview"]
         upsert_embed(url, "stat_overview", state,
                      gamestats.overview_embed(self.criteria, self.criterion_values,
-                                              len(self.criterion_values)))
+                                              len(self.criterion_values), scale))
         for key, embed in gamestats.category_embeds(
-                self.criteria, self.criterion_values,
-                curated=self.curated, top=CFG["stats_top_per_category"]):
+                self.criteria, self.criterion_values, curated=self.curated,
+                top=CFG["stats_top_per_category"], scale=scale):
             wanted.append(f"stat_{key}")
             # Space the updates out: a webhook allows roughly five requests
             # every two seconds, and this is a whole channel of cards at once.
             time.sleep(0.4)
             upsert_embed(url, f"stat_{key}", state, embed)
-        # A category can lose a page as its table shrinks; drop the leftover
-        # card rather than leaving stale numbers behind.
-        for key in [k for k in list(state["msg"])
-                    if k.startswith("stat_") and k not in wanted]:
-            if _delete_message(url, state["msg"].pop(key)):
+        self.drop_unused_cards(url, "stat_", wanted)
+
+    def refresh_daily_cards(self, now, rolled=False):
+        """Today's statistics: the same categories, counted since 03:00 Eastern."""
+        url = CFG["webhook_daily"]
+        if not url or not self.criteria:
+            return
+        state = self.state
+        scale = CFG["stats_noise_scale"]
+        deltas = subtract(self.criterion_values, state["day_stat_baseline"])
+        playtimes = all_playtimes(self.stats, state, now)
+        cards = [(f"daily_{key}", embed) for key, embed in gamestats.category_embeds(
+            self.criteria, deltas, top=CFG["daily_top_per_category"],
+            title_suffix="  ·  Today", scale=scale, skip_empty=True)]
+        wanted = ["daily_overview", "daily_playtime"] + [key for key, _ in cards]
+        # A card's place in the channel is fixed when it is first posted, and
+        # categories come and go all day as players do new things. Whenever the
+        # set changes, lay the whole channel out again so it stays in order.
+        reposition = rolled or state.get("daily_layout") != wanted
+        state["daily_layout"] = wanted
+        upsert_embed(url, "daily_overview", state,
+                     daily_overview_embed(state, self.criteria, deltas,
+                                          playtimes, now),
+                     reposition=reposition)
+        time.sleep(0.4)
+        upsert_embed(url, "daily_playtime", state,
+                     daily_playtime_embed(state, playtimes, now),
+                     reposition=reposition)
+        for key, embed in cards:
+            # Space the updates out: a webhook allows roughly five requests
+            # every two seconds, and this is a whole channel of cards at once.
+            time.sleep(0.4)
+            upsert_embed(url, key, state, embed, reposition=reposition)
+        self.drop_unused_cards(url, "daily_", wanted)
+
+    def drop_unused_cards(self, url, prefix, wanted):
+        """Remove cards whose category or page no longer has anything to show.
+
+        Categories gain and lose pages as their tables grow and shrink, and a
+        daily category empties out entirely at every reset.
+        """
+        for key in [k for k in list(self.state["msg"])
+                    if k.startswith(prefix) and k not in wanted]:
+            if _delete_message(url, self.state["msg"].pop(key)):
                 log(f"[card] removed {key}, no longer needed")
 
     # -- main loop --------------------------------------------------------
 
     def tick(self, now):
+        # First, so the transcript stays close to live even when the slower
+        # card work below runs.
+        flush_chat()
         if now - self.last_ping >= CFG["ping_seconds"]:
             self.last_ping = now
             self.do_ping(now)
@@ -1330,6 +1645,7 @@ class Bot:
             self.last_stat_cards = now
             self.refresh_stat_cards()
             save_state(self.state)
+        self.do_daily(now)
 
         due_status = now - self.last_status_refresh >= CFG["status_refresh_seconds"]
         due_boards = now - self.last_leaderboards >= CFG["leaderboard_refresh_seconds"]
@@ -1361,6 +1677,7 @@ class Bot:
             self.do_perf(time.time())
         self.refresh_cards(now, reposition=False)
         self.refresh_stat_cards()
+        self.do_daily(now)
         save_state(self.state)
 
     def run(self):

@@ -38,8 +38,15 @@ uptime and ping.
 ### Players Online — 2/1000
 > 🎮  Joksuu_      ·  on for 1h 12m
 > 🎮  PowerRubik   ·  on for 24m
-71.176.227.214:25565 • Minecraft 26.2 • up 9h 4m • 4 ms • last checked
+owengoodman.com • Minecraft 26.2 • up 9h 4m • 4 ms • last checked
 ```
+
+`public_address` is what players type, so it is what every footer shows. Players reach
+`owengoodman.com` through a Minecraft SRV record — the client follows those, this bot
+does not, and the apex A record points at Cloudflare, which does not carry Minecraft
+traffic. So the reachability check pings `check_address` (`mc.owengoodman.com:25565`)
+instead; without that split it would report the server unreachable every 15 minutes while
+players were happily connected.
 
 The card is never re-posted — it is edited in place, across restarts and server
 shutdowns alike, so the channel never accumulates duplicates. Every id this bot posts is
@@ -56,8 +63,9 @@ in the performance channel either way.
 - 🏆 **Weekly Playtime** — resets Monday, with 🏁 **Final Standings** posted permanently
 - 📈 **This Week's Statistics** — only what has moved since the week began
 
-**Statistics channel** (`webhook_stats`) — every statistic the server records, all-time.
-Currently **2,292** of them, across 41 cards.
+**Statistics channel** (`webhook_stats`) — the statistics the server records, all-time.
+The save holds **2,358** of them and **1,166** clear the noise floor, of which each card
+shows its top ten — one card per category, ten cards in all.
 
 Minecraft writes every statistic to `world/players/stats/*.json` on its own, whether or
 not a datapack declares a scoreboard objective for it, and it stores only non-zero
@@ -82,12 +90,74 @@ Cow                    owen1915         1,481
 Zombie                 owen1915           912
 ```
 
-A 🏛️ **Hall of Fame** card ranks players by how many statistics they lead. Categories
-too large for one message split across numbered cards rather than being silently
-truncated — "Items Picked Up" alone is 595 statistics over 10 cards.
+A 🏛️ **Hall of Fame** card ranks players by how many statistics they lead. Each card's
+footer says how many statistics it is showing out of how many were recorded, so the cap
+never reads as the whole picture. Set `stats_top_per_category` to `0` to show every
+statistic instead — categories too large for one message then split across numbered
+cards rather than being silently truncated.
 
-Forty-one cards is a lot of channel. Set `stats_top_per_category` to, say, `40` to keep
-each category to its headline figures instead.
+### The noise floor
+
+The save records a statistic the moment a player touches it once, so left alone the cards
+fill up with "1 iron ingot picked up" and bury everything worth reading. Each category
+gets the floor that suits how often it ticks:
+
+| Category | Needs at least |
+| --- | --- |
+| Items Picked Up | 32 — it ticks constantly, including on items other people dropped |
+| Blocks Mined / Items Dropped | 16 — a stack; below that it is incidental |
+| Items Used | 10 |
+| Items Crafted | 8 |
+| Mobs Killed | 5 |
+| Killed By / Tools Broken | 1 — deaths are rare and wearing a tool out takes real time |
+| General — distance | 1 km |
+| General — time | 5 minutes |
+| General — everything else | 5 |
+
+The bar is per player, not a total: a row appears once *somebody* is genuinely past it.
+Nothing is dropped silently — each card's footer says how many statistics were too small
+to list. `stats_noise_scale` moves every floor at once: `2.0` for only the big numbers,
+`0.1` to see almost everything, `0` to turn the filter off.
+
+**Daily channel** (`webhook_daily`) — the same categories, but counting **today only**,
+and reset at **3:00 am Eastern** rather than midnight so a late-night session stays on the
+day it felt like it belonged to.
+
+- 🌞 **Today at a Glance** — every headline total added up across the whole server:
+  blocks mined, items crafted and used, mobs killed, distance travelled, deaths, damage,
+  trades, nights slept, raids won — plus who leads the most of today's statistics
+- 📅 **Today's Playtime** — who has played today, seeded from the log archive when the
+  watcher starts partway through a day
+- one card per category that has actually moved — empty categories get no card at all,
+  and the channel is laid out again whenever the set changes so it stays in order
+
+Every statistic is tracked daily, not a subset: on a normal day here around **840** of
+them clear the noise floor. The tables show the top ten of each category, so the glance
+card is where the breadth lives — its totals are sums, so they ignore the floor entirely.
+Raise `daily_top_per_category` for longer tables.
+
+At the reset the day's totals are posted permanently as 🌅 **Yesterday's Playtime** and
+🌙 **Yesterday's Statistics**, then the live cards start over from zero.
+
+The 3:00 am boundary follows US Eastern including daylight saving. `zoneinfo` needs the
+separate `tzdata` package, which a stock Windows Python does not have, so the rule is
+spelled out in `eastern_offset()` instead — no extra dependency.
+
+**Chat history channel** (`webhook_chat`) — a plain transcript of everything that happens
+in game, whatever the other channels are configured to announce:
+
+```
+➡️  Joksuu_ joined the game  ·  2 online
+💬  Joksuu_: anyone got spare iron
+🏅  PowerRubik earned the advancement [Diamonds!]
+💀  PowerRubik was blown up by Creeper
+⬅️  Joksuu_ left the game  ·  on for 1h 12m, 1 online
+```
+
+Chat, joins, leaves, deaths, advancements and server start/stop — but not the server's
+internal log noise, which is what `webhook_logs` is for. Lines are batched into one
+message per cycle, because a busy server produces them faster than a webhook will accept
+messages, and mentions are disabled so nothing players type can ping the channel.
 
 **Performance channel** (`webhook_perf`) — a live 📈 **Performance** card, edited in place
 
@@ -129,7 +199,8 @@ Any setting can also be given as an environment variable: `MCBOT_RELAY_CHAT=1`,
 | `announce_advancements` | `true` | post advancement messages (needs `main_events`) |
 | `down_mention` | `@everyone` | who to ping when the server goes down (`""` for nobody) |
 | `down_after_seconds` | `90` | failed-ping time before announcing DOWN |
-| `external_check` | `true` | also ping `public_address` to catch port-forwarding breaking |
+| `external_check` | `true` | also ping from outside, to catch port-forwarding breaking |
+| `check_address` | `""` | what that check pings; defaults to `public_address` |
 | `perf_sample_seconds` | `30` | how often to read the host and process metrics |
 | `perf_card_seconds` | `120` | how often to redraw the performance card |
 | `perf_alerts` | `true` | post threshold alerts to the performance channel |
@@ -138,7 +209,10 @@ Any setting can also be given as an environment variable: `MCBOT_RELAY_CHAT=1`,
 | `alert_heap_pct` | `92` | warn above this share of the java heap |
 | `daily_report` | `true` | post a summary of the previous day at midnight |
 | `stats_card_seconds` | `900` | how often to redraw the all-time statistic cards |
-| `stats_top_per_category` | `0` | cap rows per category; `0` shows every statistic |
+| `stats_top_per_category` | `10` | cap rows per category; `0` shows every statistic |
+| `daily_card_seconds` | `300` | how often to redraw today's statistic cards |
+| `daily_top_per_category` | `10` | cap rows per category on the daily cards |
+| `stats_noise_scale` | `1.0` | how high the bar is to earn a row; `0` shows everything |
 
 ## Running as a service (Windows)
 
@@ -166,7 +240,12 @@ Covers following `latest.log` across appends, partial writes, UTF-8 chat and rot
 the classification of log lines (a creeper kill is a death; a `SulfurCube` dying is not);
 Bedrock names carrying Floodgate's `.` prefix; both wordings of the server's lag warning;
 and the availability ledger, including that a gap in sampling is reported as unknown
-rather than counted as uptime. No server or network needed.
+rather than counted as uptime.
+
+Also the 3:00 am Eastern day boundary across both daylight-saving changes, the noise
+floor (one iron ingot hidden, one death to a warden still shown), and that the chat
+transcript repeats everything even with every announcement setting turned off. No server
+or network needed.
 
 ## Notes
 
@@ -178,5 +257,8 @@ rather than counted as uptime. No server or network needed.
 - Stats files are only written when the server saves a player, so for anyone currently
   online the bot extends their last saved total with the session time seen in the log.
 - Starting mid-week, the weekly board is seeded by replaying the retained log archive, so
-  it is not blank until the next Monday.
+  it is not blank until the next Monday. The daily board is seeded the same way from the
+  3:00 am boundary.
+- Statistic totals have no log archive to recover from, so a week's or a day's counts
+  necessarily start from wherever they stand when the baseline is taken.
 - `enable-query` and `rcon` are both off and are not needed — nothing here depends on them.
