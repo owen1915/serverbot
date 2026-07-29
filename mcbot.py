@@ -1502,6 +1502,7 @@ class Bot:
             extra = f" — {fmt_duration(total)} all-time" if total >= 60 else " — first time here! 👋"
             chat_say(f"➡️  **{name}** joined the game  ·  *{count} online*")
             say(f":arrow_right: **{name}** joined the server ({count} online){extra}")
+            self.tab_join(name)
             self.dirty = True
             self.check_record(count)
             return
@@ -1809,6 +1810,18 @@ class Bot:
         ("villager trades", "trades", "{:,.0f}"),
     ]
 
+    def _tab_row_cmds(self, agg, name, index):
+        """The two commands that write one player's labelled tab entry."""
+        label, source, fmt = self.TAB_STATS[index % len(self.TAB_STATS)]
+        if callable(source):
+            value = source(self, agg, name)
+        else:
+            value = agg.get(name, {}).get(source, 0)
+        shown = fmt.format(value)
+        return [f"scoreboard players set {name} mcbot_tab {int(value)}",
+                f"scoreboard players display numberformat {name} "
+                f'mcbot_tab fixed "{shown} {label}"']
+
     def rotate_tab(self, online):
         """Show the next statistic in the tab list, labelled on every row.
 
@@ -1821,20 +1834,27 @@ class Bot:
         agg = funstats.aggregate(self.criteria, self.criterion_values)
         index = self.fun.get("tab_index", 0) % len(self.TAB_STATS)
         self.fun["tab_index"] = index + 1
-        label, source, fmt = self.TAB_STATS[index]
+        self.fun["tab_current"] = index
         cmds = ["scoreboard objectives add mcbot_tab dummy"]
         for name in online:
-            if callable(source):
-                value = source(self, agg, name)
-            else:
-                value = agg.get(name, {}).get(source, 0)
-            shown = fmt.format(value)
-            cmds.append(f"scoreboard players set {name} mcbot_tab {int(value)}")
-            cmds.append(f"scoreboard players display numberformat {name} "
-                        f'mcbot_tab fixed "{shown} {label}"')
+            cmds += self._tab_row_cmds(agg, name, index)
         cmds.append("scoreboard objectives setdisplay list mcbot_tab")
         if rcon.commands(CFG["server_dir"], cmds) is not None:
-            log(f"[tab] now showing {label}")
+            log(f"[tab] now showing {self.TAB_STATS[index][0]}")
+
+    def tab_join(self, name):
+        """Stamp a joining player's row with whatever the tab is showing now.
+
+        Without this, somebody who joins mid-cycle sits unlabelled until the
+        next rotation — up to half an hour away.
+        """
+        if not CFG["tab_stats"] or DRY_RUN:
+            return
+        index = self.fun.get("tab_current")
+        if index is None:
+            return
+        agg = funstats.aggregate(self.criteria, self.criterion_values)
+        rcon.commands(CFG["server_dir"], self._tab_row_cmds(agg, name, index))
 
     def maybe_fun_fact(self, now):
         """Every so often, tell the room something true about somebody in it.
