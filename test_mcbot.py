@@ -525,17 +525,19 @@ def test_fun_facts():
         "fish_caught": 1, "trades": 2, "animals_bred": 0, "damage_taken": 0,
     }
     facts = funstats.fun_facts("owen1915", entry, chat_total=500, streak=4)
-    joined = " | ".join(facts)
+    kinds = [kind for kind, _ in facts]
+    joined = " | ".join(text for _, text in facts)
     check("the favorite block is named", "55,660 Netherrack" in joined, True)
     check("the nemesis is named", "Creeper has killed owen1915 9 times" in joined,
           True)
     check("distance converts to marathons", "10.0 marathons" in joined, True)
-    check("one fish is not worth announcing", "fish" in joined, False)
+    check("one fish is not worth announcing", "fish" in kinds, False)
     check("chat and streak facts appear",
           "500 chat messages" in joined and "4 days in a row" in joined, True)
+    check("every fact carries a distinct kind", len(kinds), len(set(kinds)))
     check("an empty save yields the mystery fact",
           funstats.fun_facts("ghost", {"raw": {}}),
-          ["ghost remains a person of complete mystery"])
+          [("mystery", "ghost remains a person of complete mystery")])
 
 
 def test_ledger():

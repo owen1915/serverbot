@@ -1267,6 +1267,9 @@ FUN_DEFAULTS = {
     "annv": [],               # world anniversaries already announced
     "mvp": "",                # yesterday's Most Dedicated, for the MOTD
     "motd_sig": "",           # what the MOTD currently says, to skip rewrites
+    "fact_recent": [],        # who the fun facts featured lately, newest last
+    "fact_kinds": [],         # which kinds of fact were told lately
+    "next_fact": 0.0,         # when the next fact is due — survives restarts
 }
 
 
@@ -1320,8 +1323,6 @@ class Bot:
         self.last_stat_cards = 0.0
         self.last_daily_cards = 0.0
         self.last_motd = 0.0
-        self.next_fact = time.time() + random.uniform(120, 1200)
-        self.fact_recent = []   # who was featured lately, newest last
         self.status = None
         # The datapacks' objectives are a curated goal list, used to say which
         # goals are still unmet. What gets *shown* comes from the save itself,
@@ -1777,34 +1778,55 @@ class Bot:
                                    f"{fmt(top - second)} of {leader} in {label} "
                                    f"({fmt(second)} vs {fmt(top)}).")
 
+    # Readable on the dark chat background; picked at random per fact.
+    FACT_COLORS = ("aqua", "green", "yellow", "gold", "light_purple",
+                   "red", "blue", "dark_aqua", "white")
+
     def maybe_fun_fact(self, now):
         """Every so often, tell the room something true about somebody in it.
 
         Fires at jittered moments averaging fun_facts_per_hour, and only
-        when somebody is actually online to be told about. Whoever was
-        featured most recently is skipped, so the same player is not the
-        subject twice running.
+        when somebody is actually online to be told about — an empty server
+        is told nothing. Both the featured player and the *kind* of fact
+        rotate: the last two players and the last six kinds are skipped, so
+        it neither dwells on one person nor keeps reciting jump counts.
         """
-        if not CFG["fun_facts_per_hour"] or now < self.next_fact:
+        if not CFG["fun_facts_per_hour"] or DRY_RUN:
             return
+        fun = self.fun
         average = 3600 / CFG["fun_facts_per_hour"]
-        self.next_fact = now + random.uniform(average * 0.6, average * 1.4)
-        online = [n for n in self.state["players"] if n in self.stats]
-        if not online or DRY_RUN:
+        # The schedule is persisted, so a restart neither fires a fact early
+        # nor re-rolls the countdown — the cadence holds across restarts.
+        if not fun["next_fact"]:
+            fun["next_fact"] = now + random.uniform(average * 0.6, average * 1.4)
             return
-        fresh = [n for n in online if n not in self.fact_recent[-2:]]
+        if now < fun["next_fact"]:
+            return
+        fun["next_fact"] = now + random.uniform(average * 0.6, average * 1.4)
+        online = [n for n in self.state["players"] if n in self.stats]
+        if not online:
+            return
+        # Prefer whoever has not featured in the last two facts; failing
+        # that, anyone but the very last subject. Only a player alone on the
+        # server can be the subject twice running.
+        recent = fun["fact_recent"]
+        fresh = [n for n in online if n not in recent[-2:]]
+        if not fresh:
+            fresh = [n for n in online if n != (recent[-1] if recent else "")]
         name = random.choice(fresh or online)
         facts = funstats.fun_facts(
             name, self.stats[name],
-            chat_total=self.fun["chat_total"].get(name, 0),
-            streak=self.fun["streaks"].get(name, {}).get("current", 0))
-        fact = random.choice(facts)
+            chat_total=fun["chat_total"].get(name, 0),
+            streak=fun["streaks"].get(name, {}).get("current", 0))
+        unworn = [f for f in facts if f[0] not in fun["fact_kinds"][-6:]]
+        kind, fact = random.choice(unworn or facts)
         if rcon.broadcast(CFG["server_dir"], f"Did you know? {fact}",
-                          color="aqua") is None:
+                          color=random.choice(self.FACT_COLORS)) is None:
             return  # nobody heard it — keep it out of the transcript too
-        self.fact_recent = (self.fact_recent + [name])[-4:]
+        fun["fact_recent"] = (fun["fact_recent"] + [name])[-4:]
+        fun["fact_kinds"] = (fun["fact_kinds"] + [kind])[-8:]
         chat_say(f"✨  *Did you know? {fact}*")
-        log(f"[fact] {fact}")
+        log(f"[fact] ({kind}) {fact}")
 
     def roll_day(self, playtimes, now):
         """The 3:00 am Eastern ceremony: recap, awards, records, streaks.
