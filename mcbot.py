@@ -1837,6 +1837,10 @@ class Bot:
     # lifetime aggregate; callables read anything else.
     TAB_STATS = [
         ("blocks mined", "mined", "{:,.0f}", "aqua"),
+        ("online",
+         lambda self, agg, name: time.time()
+         - self.state["players"].get(name, time.time()),
+         fmt_duration, "white"),
         ("deaths", "deaths", "{:,.0f}", "red"),
         ("hours played",
          lambda self, agg, name: self.stats.get(name, {}).get("play_time", 0) / 3600,
@@ -1863,8 +1867,9 @@ class Bot:
             value = source(self, agg, name)
         else:
             value = agg.get(name, {}).get(source, 0)
+        shown = fmt(value) if callable(fmt) else fmt.format(value)
         component = json.dumps([
-            {"text": fmt.format(value) + " ", "color": color, "bold": True},
+            {"text": shown + " ", "color": color, "bold": True},
             {"text": label, "color": "gray"},
         ])
         return [f"scoreboard players set {name} mcbot_tab {int(value)}",
@@ -2573,6 +2578,12 @@ class Bot:
             self.refresh_criteria()
             self.check_milestones(all_playtimes(self.stats, self.state, now))
             self.check_fun(now)
+            # A session clock frozen at its last rotation would be wrong most
+            # of the time — while it is the stat on display, keep it ticking.
+            current = self.fun.get("tab_current")
+            if (current is not None and self.state["players"]
+                    and self.TAB_STATS[current % len(self.TAB_STATS)][0] == "online"):
+                self.refresh_tab_now(list(self.state["players"]))
         self.maybe_fun_fact(now)
         if (CFG["external_check"] and CFG["public_address"]
                 and now - self.last_external >= CFG["external_check_minutes"] * 60):
