@@ -275,6 +275,18 @@ def test_statistic_criteria():
           ["Warden"])
 
 
+def test_motd():
+    """Formatting codes must be stripped, whatever shape the MOTD arrives in."""
+    check("legacy codes are stripped from a plain string",
+          mcbot.describe_motd("§a§oBigBoys SMP"), "BigBoys SMP")
+    check("hex colours are stripped",
+          mcbot.describe_motd("§x§F§F§0§0§0§0Hot §rServer"), "Hot Server")
+    check("chat components are flattened and stripped",
+          mcbot.describe_motd({"text": "§lBig", "extra": [{"text": " §aBoys"}]}),
+          "Big Boys")
+    check("plain text passes through", mcbot.describe_motd("Hello"), "Hello")
+
+
 def test_day_boundary():
     """The statistics day turns over at 03:00 Eastern, summer and winter."""
     import datetime as dt
@@ -503,6 +515,8 @@ def main():
     test_weekly_statistic_deltas()
     print()
     test_statistic_criteria()
+    print()
+    test_motd()
     print()
     test_day_boundary()
     print()

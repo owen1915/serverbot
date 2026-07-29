@@ -513,12 +513,21 @@ def ping_server(host=None, port=None, timeout=5):
                 pass
 
 
+# Legacy formatting: § followed by a colour/style code. A hex colour is six
+# of these in a row (§x§F§F§0§0§0§0), so the same pattern consumes it too.
+MOTD_CODE_RE = re.compile("§.")
+
+
 def describe_motd(desc):
-    """Flatten a chat-component or plain-string MOTD into text."""
+    """Flatten a chat-component or plain-string MOTD into plain text.
+
+    Discord renders none of Minecraft's formatting, so the § codes are
+    stripped rather than translated.
+    """
     if isinstance(desc, str):
-        return desc
+        return MOTD_CODE_RE.sub("", desc)
     if isinstance(desc, dict):
-        text = desc.get("text", "")
+        text = describe_motd(desc.get("text", ""))
         for extra in desc.get("extra", []):
             text += describe_motd(extra)
         return text
