@@ -13,8 +13,10 @@ import tempfile
 
 import mcbot
 
-# Keep test output out of the real watcher's log.
+# Keep test output out of the real watcher's log, and point the bot away
+# from the real server so nothing in a test can reach RCON or the save.
 mcbot.LOG_FILE = os.path.join(tempfile.mkdtemp(), "test.log")
+mcbot.CFG["server_dir"] = tempfile.mkdtemp()
 
 HEADER =("[05:36:30] [main/INFO]: Loading Minecraft 26.2 with Fabric Loader 0.19.3\n"
           "[05:36:31] [main/INFO]: " + "x" * 400 + "\n")
@@ -85,6 +87,8 @@ def test_events():
     bot.state = mcbot.new_state()
     bot.fun = mcbot.fun_state(bot.state)
     bot.stats = {}
+    bot.criteria = []
+    bot.criterion_values = {}
     bot.dirty = False
     bot.perf = None
 
@@ -130,6 +134,8 @@ def test_bedrock_names():
     bot.state = mcbot.new_state()
     bot.fun = mcbot.fun_state(bot.state)
     bot.stats = {}
+    bot.criteria = []
+    bot.criterion_values = {}
     bot.dirty = False
     bot.perf = None
 
@@ -166,6 +172,8 @@ def test_lag_parsing():
     bot.state = mcbot.new_state()
     bot.fun = mcbot.fun_state(bot.state)
     bot.stats = {}
+    bot.criteria = []
+    bot.criterion_values = {}
     bot.dirty = False
     bot.perf = Recorder()
 
@@ -612,6 +620,8 @@ def test_chat_transcript():
     bot.state = mcbot.new_state()
     bot.fun = mcbot.fun_state(bot.state)
     bot.stats = {}
+    bot.criteria = []
+    bot.criterion_values = {}
     bot.dirty = False
     bot.perf = None
 

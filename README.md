@@ -170,10 +170,14 @@ Announcement state is seeded silently on first run, so switching the feature on 
 replay history as news. Without `webhook_events` these are dropped (logged once); the
 other channels stay silent by design, so nothing is rerouted into them.
 
-**Leaderboard channel additions** — four more edited-in-place cards:
+**Leaderboard channel additions** — six more edited-in-place cards:
 
 - 📜 **Single-Day Records** — the all-time ledger of daily bests
 - 🔥 **Playtime Streaks** — current runs (10+ minutes counts) and the longest ever
+- 📊 **Server Activity** — player-hours per day, the last week as bars
+- 🗺️ **Activity Map** — an ASCII density map of the overworld from Ledger's
+  location-stamped events, last 7 days, ★ on the busiest spot, percentile-clipped so
+  one long errand cannot zoom the map out to nothing
 - 🕐 **Prime Time** — a 24-hour histogram of player-hours by clock hour, seeded from the
   whole log archive and accumulated live from then on
 - 🗣️ **Chat Leaders** — lifetime message counts, also archive-seeded
@@ -259,7 +263,19 @@ off, so nothing breaks when it isn't available:
 - **Cycling tab list** (`tab_stats`) — on the same beat, the tab list shows the next
   statistic in rotation, labelled on every row via a fixed number format:
   "owen1915  1,234 blocks mined". Ten statistics cycle: mined, deaths, hours, mob
-  kills, km travelled, placed, jumps, diamond ore, fish, trades
+  kills, km travelled, placed, jumps, diamond ore, fish, trades. Players who join
+  mid-cycle are stamped with the current statistic immediately
+- **Welcome whispers** (`welcome_whispers`) — a private tellraw on join: "Welcome
+  back, owen1915 — day 6 of your streak, you slipped #2 → #4 in blocks mined while
+  you were away." First-timers get a public hello instead. Quick relogs get nothing
+- **Join anniversaries** — one week, one month, 100 days and every year since each
+  player's first join, announced at the daily roll. First-join dates are seeded from
+  the log archive, stats-file creation times and Ledger, earliest evidence winning
+- **Backup watchdog** (`backup_watch`) — each morning the bot confirms a fresh world
+  backup archive actually exists (Crafty is supposed to make one nightly) and raises
+  an alert in the performance channel when it cannot find one newer than
+  `backup_max_age_hours`. Point `backup_watch_dir` at the backup folder if the
+  usual Crafty locations are wrong. A quiet morning means the backup happened
 - **Dynamic MOTD** (`dynamic_motd`) — see below
 
 ## The dynamic MOTD

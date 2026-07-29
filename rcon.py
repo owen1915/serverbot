@@ -152,3 +152,14 @@ def broadcast(server_dir, text, color="gold"):
     return command(server_dir, "tellraw @a " + json.dumps(
         [{"text": "✦ ", "color": "yellow"},
          {"text": plain, "color": color}]))
+
+
+def whisper(server_dir, player, text, color="gray"):
+    """Say something to one player only. Quietly does nothing without RCON."""
+    plain = NON_TEXT_RE.sub("", MARKDOWN_RE.sub("", text)).strip()
+    if not plain:
+        return None
+    import json
+    return command(server_dir, f"tellraw {player} " + json.dumps(
+        [{"text": "✦ ", "color": "yellow"},
+         {"text": plain, "color": color, "italic": True}]))

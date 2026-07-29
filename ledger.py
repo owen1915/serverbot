@@ -91,6 +91,103 @@ def activity(server_dir, since_epoch):
         db.close()
 
 
+DENSITY = " ░▒▓█"
+
+
+def heatmap(server_dir, since_epoch, world="minecraft:overworld",
+            cols=26, rows=12):
+    """A density grid of where the action has been, or None without data.
+
+    The 2nd–98th percentile of event positions sets the bounds, so one long
+    nether-portal errand cannot zoom the whole map out to nothing.
+    """
+    db = _connect(server_dir)
+    if db is None:
+        return None
+    try:
+        points = db.execute(
+            "SELECT a.x, a.z FROM actions a "
+            "JOIN worlds w ON w.id = a.world_id "
+            "WHERE a.time >= ? AND a.player_id IS NOT NULL "
+            "AND w.identifier = ?", (_stamp(since_epoch), world)).fetchall()
+    except sqlite3.Error:
+        return None
+    finally:
+        db.close()
+    if len(points) < 20:
+        return None
+    xs = sorted(p[0] for p in points)
+    zs = sorted(p[1] for p in points)
+    lo, hi = len(xs) * 2 // 100, len(xs) * 98 // 100
+    x0, x1 = xs[lo], xs[hi]
+    z0, z1 = zs[lo], zs[hi]
+    # At least one chunk per cell, and identical scale on both axes so the
+    # map is not silently stretched.
+    cell = max(16, (x1 - x0) // cols + 1, (z1 - z0) // rows + 1)
+    x0 = (x0 // cell) * cell
+    z0 = (z0 // cell) * cell
+    grid = [[0] * cols for _ in range(rows)]
+    for x, z in points:
+        col = min(max((x - x0) // cell, 0), cols - 1)
+        row = min(max((z - z0) // cell, 0), rows - 1)
+        grid[row][col] += 1
+    peak = max(max(row) for row in grid)
+    lines = []
+    for r, row in enumerate(grid):
+        cells = []
+        for c, count in enumerate(row):
+            if count and count == peak:
+                cells.append("★")
+            elif count:
+                # Log-ish scale: a base camp must not white out the map.
+                level = min(len(DENSITY) - 1,
+                            1 + int(3 * (count / peak) ** 0.4))
+                cells.append(DENSITY[level])
+            else:
+                cells.append(DENSITY[0])
+        lines.append("".join(cells))
+    return {
+        "grid": lines,
+        "cell": cell,
+        "x_range": (x0, x0 + cell * cols),
+        "z_range": (z0, z0 + cell * rows),
+        "events": len(points),
+    }
+
+
+def heatmap_embed(data, label):
+    x0, x1 = data["x_range"]
+    z0, z1 = data["z_range"]
+    return {
+        "title": "🗺️  Activity Map",
+        "description": (
+            f"### {label}\n"
+            "```\n" + "\n".join(data["grid"]) + "\n```\n"
+            f"**{data['events']:,}** logged actions in the overworld  ·  "
+            f"★ marks the busiest spot\n"
+            f"> x {x0:,} … {x1:,}   ·   z {z0:,} … {z1:,}   ·   "
+            f"{data['cell']}m per cell"),
+        "color": 0x2C3E50,
+        "footer": {"text": "from Ledger's event log  •  north is up"},
+    }
+
+
+def first_joins(server_dir):
+    """{name: 'YYYY-MM-DD'} — when Ledger first saw each player."""
+    db = _connect(server_dir)
+    if db is None:
+        return {}
+    try:
+        return {name: (stamp or "")[:10]
+                for name, stamp in db.execute(
+                    "SELECT player_name, first_join FROM players")
+                if stamp}
+    except sqlite3.Error:
+        return {}
+    finally:
+        db.close()
+
+
 def building_embed(report, label):
     """The daily ground-truth card: who built what, and where the action was."""
     ranked = sorted(report["players"].items(),

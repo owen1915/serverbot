@@ -46,7 +46,7 @@ LOG_FILE = os.path.join(HERE, "mcbot.log")
 USER_AGENT = "mcbot/2.0 (local server watcher)"
 # Bumped when the set of cards in a channel changes, so the old ones are
 # cleared out and the new set is posted in the intended order.
-LAYOUT_VERSION = 5
+LAYOUT_VERSION = 6
 TICKS_PER_SECOND = 20
 
 # All-time playtime marks that earn a shout-out, in hours.
@@ -109,6 +109,15 @@ DEFAULTS = {
     "fun_facts_per_hour": 3,
     # Cycle a labelled statistic through the tab list, on the same timer.
     "tab_stats": True,
+    # Whisper a personalised greeting to players when they join.
+    "welcome_whispers": True,
+    # Crafty is supposed to back the world up nightly; this checks that it
+    # actually did, and raises an alert in the performance channel if no
+    # fresh backup file can be found each morning. Point backup_watch_dir at
+    # wherever the backups land; empty searches the usual Crafty locations.
+    "backup_watch": True,
+    "backup_watch_dir": "",
+    "backup_max_age_hours": 26,
     # Keep the MOTD fresh through MiniMOTD's config. Also needs RCON.
     "dynamic_motd": True,
     "motd_refresh_seconds": 600,
@@ -389,6 +398,8 @@ def webhook_for(card):
         "weekstats": CFG["webhook_weekly"],
         "records": CFG["webhook_weekly"],
         "streaks": CFG["webhook_weekly"],
+        "activity": CFG["webhook_weekly"],
+        "heatmap": CFG["webhook_weekly"],
         "primetime": CFG["webhook_weekly"],
         "chatstats": CFG["webhook_weekly"],
         "stats": CFG["webhook_weekly"],  # retired card, kept so it can be swept
@@ -1199,6 +1210,31 @@ def daily_overview_embed(state, criteria, deltas, playtimes, now):
     }
 
 
+def activity_embed(fun, played_today, now):
+    """Player-hours per day, up to a week of them, as bars."""
+    rows = []
+    for entry in fun["history"][-6:]:
+        totals = entry["played"].values()
+        rows.append((entry["day"], sum(totals) / 3600,
+                     sum(1 for v in totals if v >= 600), ""))
+    rows.append((day_key(now), sum(played_today.values()) / 3600,
+                 sum(1 for v in played_today.values() if v >= 600), " *"))
+    peak = max((hours for _, hours, _, _ in rows), default=0)
+    lines = []
+    for day, hours, players, mark in rows:
+        stamp = dt.date.fromisoformat(day).strftime("%a %b %d")
+        bar = "█" * round(14 * hours / peak) if peak else ""
+        lines.append(f"{stamp}  {bar:<14} {hours:5.1f}h · {players}p{mark}")
+    return {
+        "title": "📊  Server Activity",
+        "description": ("### Player-hours by day\n```\n"
+                        + "\n".join(lines) + "\n```\n"
+                          "-# * today so far"),
+        "color": 0x16A085,
+        "footer": {"text": "10+ minutes counts a player  •  resets 3:00 am Eastern"},
+    }
+
+
 def alltime_embed(playtimes, prev_ranks=None, pace=()):
     """Lifetime hours, with movement arrows against yesterday's ranking."""
     ranked = sorted((kv for kv in playtimes.items() if kv[1]),
@@ -1273,6 +1309,12 @@ FUN_DEFAULTS = {
     "fact_kinds": [],         # which kinds of fact were told lately
     "fact_history": [],       # [epoch, name, kind] — nothing repeats in an hour
     "next_fact": 0.0,         # when the next fact is due — survives restarts
+    "last_seen": {},          # name -> epoch of their latest leave
+    "depart_ranks": {},       # name -> their standings when they last left
+    "first_seen": {},         # name -> the date they first joined
+    "first_seen_seeded": False,
+    "annv_players": [],       # "name:days" anniversaries already announced
+    "backup_check_day": "",   # the last morning the backup watchdog reported
 }
 
 
@@ -1377,24 +1419,26 @@ class Bot:
         """
         if self.state.get("layout") == LAYOUT_VERSION or DRY_RUN:
             return
-        for key in ("weekly", "alltime", "stats", "weekstats",
-                    "records", "streaks", "primetime", "chatstats"):
+        old = self.state.get("layout")
+        for key in ("weekly", "alltime", "stats", "weekstats", "records",
+                    "streaks", "activity", "heatmap", "primetime", "chatstats"):
             mid = self.state["msg"].pop(key, None)
             if mid and CFG["webhook_weekly"]:
-                _delete_message(CFG["webhook_weekly"], mid)
-        # Statistic cards gain and lose pages as categories grow, and new pages
-        # would otherwise land at the bottom of the channel instead of after
-        # the category they belong to.
-        for key in [k for k in list(self.state["msg"])
-                    if k.startswith("stat_") or k.startswith("daily_")]:
-            mid = self.state["msg"].pop(key)
-            url = webhook_for(key)
-            if mid and url:
                 time.sleep(0.3)
-                _delete_message(url, mid)
+                _delete_message(CFG["webhook_weekly"], mid)
+        # Only touch the other channels when coming from a layout old enough
+        # to need it — the daily channel's whole promise is that its cards
+        # are never re-posted.
+        if old is None or old < 5:
+            for key in [k for k in list(self.state["msg"])
+                        if k.startswith("stat_") or k.startswith("daily_")]:
+                mid = self.state["msg"].pop(key)
+                url = webhook_for(key)
+                if mid and url:
+                    time.sleep(0.3)
+                    _delete_message(url, mid)
         self.state["layout"] = LAYOUT_VERSION
-        log("[card] re-laid out the leaderboard and statistics channels",
-            mirror=True)
+        log("[card] re-laid out the leaderboard channel", mirror=True)
 
     def sweep(self):
         """Clear out any duplicate cards left behind by an earlier run."""
@@ -1503,6 +1547,7 @@ class Bot:
             chat_say(f"➡️  **{name}** joined the game  ·  *{count} online*")
             say(f":arrow_right: **{name}** joined the server ({count} online){extra}")
             self.tab_join(name)
+            self.greet(name, now)
             self.dirty = True
             self.check_record(count)
             return
@@ -1518,6 +1563,7 @@ class Bot:
                      f"{count} online*")
             say(f":arrow_left: **{name}** left the server ({count} online) "
                 f"— was on for **{played}**")
+            self.note_departure(name, now)
             self.dirty = True
             return
 
@@ -1923,6 +1969,143 @@ class Bot:
         chat_say(f"✨  *Did you know? {fact}*")
         log(f"[fact] ({kind}) {fact}")
 
+    def _standings(self, now):
+        """{stat label: {name: rank}} for the welcome-back comparisons."""
+        agg = funstats.aggregate(self.criteria, self.criterion_values)
+        boards = {
+            "hours played": all_playtimes(self.stats, self.state, now),
+            "blocks mined": {n: a.get("mined", 0) for n, a in agg.items()},
+        }
+        out = {}
+        for label, scores in boards.items():
+            ordered = sorted((kv for kv in scores.items() if kv[1] > 0),
+                             key=lambda kv: -kv[1])
+            out[label] = {n: i + 1 for i, (n, _) in enumerate(ordered)}
+        return out
+
+    def note_departure(self, name, now):
+        """Remember when they left and where they stood, for the welcome back."""
+        fun = self.fun
+        fun["last_seen"][name] = now
+        fun["depart_ranks"][name] = {
+            label: ranks.get(name)
+            for label, ranks in self._standings(now).items()}
+
+    def greet(self, name, now):
+        """First-timers get a public welcome; returners get a private one."""
+        if not CFG["welcome_whispers"] or DRY_RUN:
+            return
+        fun = self.fun
+        if name not in fun["first_seen"]:
+            fun["first_seen"][name] = stat_day(now).isoformat()
+            rcon.broadcast(CFG["server_dir"],
+                           f"Everyone say hi to {name} — first time here!",
+                           color="light_purple")
+            return
+        gone = now - fun["last_seen"].get(name, now)
+        if gone < 1800:
+            return  # a quick relog does not need a ceremony
+        parts = []
+        if gone >= 36 * 3600:
+            parts.append(f"you were away {fmt_duration(gone)}")
+        streak = fun["streaks"].get(name, {}).get("current", 0)
+        if streak >= 2:
+            parts.append(f"day {streak + 1} of your streak")
+        # The petty part: did anybody pass them while they were gone?
+        old = fun["depart_ranks"].get(name, {})
+        if gone >= 6 * 3600 and old:
+            for label, ranks in self._standings(now).items():
+                was, now_rank = old.get(label), ranks.get(name)
+                if was and now_rank and now_rank > was:
+                    parts.append(f"you slipped #{was} → #{now_rank} in {label} "
+                                 f"while you were away")
+                    break
+        text = f"Welcome back, {name}" + (f" — {', '.join(parts)}" if parts else "!")
+        rcon.whisper(CFG["server_dir"], name, text)
+
+    def seed_first_seen(self):
+        """When did each player first join? Best evidence wins, once.
+
+        The log archive gives real join lines but only reaches as far back
+        as retention; a stats file's creation time reaches to the day the
+        player's data first existed; Ledger only knows about players it has
+        seen since it was installed. Earliest evidence wins.
+        """
+        fun = self.fun
+        if fun["first_seen_seeded"]:
+            return
+        earliest = {}
+        for when, msg in read_all_logs():
+            m = JOIN_RE.match(msg)
+            if m and m.group(1) not in earliest:
+                earliest[m.group(1)] = when
+        for name, entry in self.stats.items():
+            path = os.path.join(STATS_DIR, f"{entry['uuid']}.json")
+            try:
+                created = os.path.getctime(path)
+            except OSError:
+                continue
+            earliest[name] = min(earliest.get(name, created), created)
+        dates = {n: dt.date.fromtimestamp(t).isoformat()
+                 for n, t in earliest.items()}
+        for name, stamp in ledger.first_joins(CFG["server_dir"]).items():
+            dates.setdefault(name, stamp)
+        dates.update(fun["first_seen"])  # anything already recorded wins
+        fun["first_seen"] = dates
+        fun["first_seen_seeded"] = True
+        log(f"[fun] first-join dates seeded for {len(dates)} players")
+
+    # -- the backup watchdog ----------------------------------------------
+
+    def _newest_backup(self):
+        """(path, mtime) of the freshest backup archive, or None."""
+        watch = CFG["backup_watch_dir"]
+        if watch:
+            roots = [watch]
+        else:
+            servers_root = os.path.dirname(CFG["server_dir"].rstrip("/\\"))
+            crafty_root = os.path.dirname(servers_root)
+            roots = [os.path.join(crafty_root, "backups"),
+                     os.path.join(servers_root, "backups")]
+        found = []
+        for root in roots:
+            for dirpath, _, files in os.walk(root):
+                for name in files:
+                    if name.lower().endswith((".zip", ".tar.gz", ".tgz", ".7z")):
+                        path = os.path.join(dirpath, name)
+                        try:
+                            found.append((path, os.path.getmtime(path)))
+                        except OSError:
+                            pass
+        return max(found, key=lambda pair: pair[1]) if found else None
+
+    def check_backups(self, now):
+        """Each morning, confirm Crafty's nightly backup actually happened.
+
+        The backup nobody checks is the one that has been failing for a
+        month. This only ever raises an alarm — a quiet morning means a
+        fresh archive was found.
+        """
+        if not CFG["backup_watch"] or DRY_RUN:
+            return
+        today = day_key(now)
+        hour = int(eastern_clock(now)[:2])
+        if hour < 5 or self.fun["backup_check_day"] == today:
+            return
+        self.fun["backup_check_day"] = today
+        newest = self._newest_backup()
+        if newest and now - newest[1] <= CFG["backup_max_age_hours"] * 3600:
+            log(f"[backup] fresh backup found: {newest[0]}")
+            return
+        if newest:
+            perf_say(f"🟠 **Backup watch:** the newest world backup is "
+                     f"**{fmt_duration(now - newest[1])}** old "
+                     f"(`{os.path.basename(newest[0])}`) — Crafty's nightly "
+                     f"backup may be failing.")
+        else:
+            perf_say("🟠 **Backup watch:** no world backup archive could be "
+                     "found at all — check Crafty's backup configuration.")
+
     def roll_day(self, playtimes, now):
         """The 3:00 am Eastern ceremony: recap, awards, records, streaks.
 
@@ -2002,6 +2185,23 @@ class Bot:
                         if age % 365 == 0 else "!"
                     events_say(f"🎂  **The world is {age} days old today{years}** "
                                f"It began on {fun['world_first_day']}.")
+
+            # Player join anniversaries.
+            marks = {7: "One week", 30: "One month", 100: "100 days"}
+            for name, first in sorted(fun["first_seen"].items()):
+                try:
+                    days = (stat_day(now) - dt.date.fromisoformat(first)).days
+                except ValueError:
+                    continue
+                mark = marks.get(days)
+                if not mark and days > 0 and days % 365 == 0:
+                    years = days // 365
+                    mark = f"{years} year{'s' if years > 1 else ''}"
+                key = f"{name}:{days}"
+                if mark and key not in fun["annv_players"]:
+                    fun["annv_players"].append(key)
+                    events_say(f"🎈  **{mark}** since **{name}** first joined "
+                               f"the server!")
 
         if first_run:
             # Starting partway through a day: recover the playtime already
@@ -2091,6 +2291,15 @@ class Bot:
                      funstats.records_embed(fun["records"]))
         upsert_embed(url, "streaks", state,
                      funstats.streaks_embed(fun["streaks"]))
+        time.sleep(0.4)
+        played_today = {n: max(0, t - state["day_playtime_baseline"].get(n, t))
+                        for n, t in playtimes.items()}
+        upsert_embed(url, "activity", state,
+                     activity_embed(fun, played_today, now))
+        heat = ledger.heatmap(CFG["server_dir"], now - 7 * 86400)
+        if heat:
+            upsert_embed(url, "heatmap", state,
+                         ledger.heatmap_embed(heat, "Where the action was — last 7 days"))
         time.sleep(0.4)
         upsert_embed(url, "primetime", state,
                      funstats.primetime_embed(fun["hours"]))
@@ -2348,6 +2557,7 @@ class Bot:
             self.last_external = now
             self.do_external_check()
         self.do_perf(now)
+        self.check_backups(now)
         if (CFG["webhook_stats"]
                 and now - self.last_stat_cards >= CFG["stats_card_seconds"]):
             self.last_stat_cards = now
@@ -2373,6 +2583,7 @@ class Bot:
         self.do_ping(now)
         self.stats = load_stats()
         self.refresh_criteria()
+        self.seed_first_seen()
         self.check_milestones(all_playtimes(self.stats, self.state, now))
         if self.perf:
             # CPU percentages and I/O rates are deltas between readings, so a
@@ -2399,6 +2610,7 @@ class Bot:
         self.do_ping(time.time())
         self.stats = load_stats()
         self.refresh_criteria()
+        self.seed_first_seen()
         self.check_milestones(all_playtimes(self.stats, self.state, time.time()))
         self.dirty = True
         while True:
