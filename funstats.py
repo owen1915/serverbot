@@ -480,6 +480,84 @@ def advancements_embed(done_sets):
     }
 
 
+# ---------------------------------------------------------------- fun facts --
+
+MARATHON_KM = 42.195
+
+
+def fun_facts(name, entry, chat_total=0, streak=0):
+    """Every true thing worth saying about one player, from their own save.
+
+    The caller picks one at random; everything here is only offered when the
+    underlying number is big enough to be worth announcing.
+    """
+    raw = entry.get("raw", {})
+    custom = raw.get("minecraft:custom", {})
+
+    def top(section):
+        table = raw.get(section, {})
+        if not table:
+            return None
+        key = max(table, key=table.get)
+        return key.split(":", 1)[-1].replace("_", " ").title(), table[key]
+
+    facts = []
+    favorite = top("minecraft:mined")
+    if favorite and favorite[1] >= 100:
+        facts.append(f"{name} has mined {favorite[1]:,} {favorite[0]} — "
+                     f"their favorite block")
+    nemesis = top("minecraft:killed_by")
+    if nemesis and nemesis[1] >= 2:
+        facts.append(f"{nemesis[0]} has killed {name} {nemesis[1]:,} times. "
+                     f"A true nemesis")
+    prey = top("minecraft:killed")
+    if prey and prey[1] >= 25:
+        facts.append(f"{name} has personally ended {prey[1]:,} {prey[0]}s")
+    deaths = entry.get("deaths", 0)
+    if deaths >= 3:
+        facts.append(f"{name} has died {deaths:,} times so far")
+    km = entry.get("distance_cm", 0) / 100_000
+    if km >= 10:
+        marathons = km / MARATHON_KM
+        facts.append(f"{name} has travelled {km:,.0f} km — "
+                     f"about {marathons:,.1f} marathons")
+    jumps = custom.get("minecraft:jump", 0)
+    if jumps >= 1000:
+        facts.append(f"{name} has jumped {jumps:,} times")
+    fish = entry.get("fish_caught", 0)
+    if fish >= 5:
+        facts.append(f"{name} has pulled {fish:,} fish out of the water")
+    hours = entry.get("play_time", 0) / 3600
+    if hours >= 5:
+        facts.append(f"{name} has spent {hours:,.0f} hours of their life here")
+    chests = custom.get("minecraft:open_chest", 0)
+    if chests >= 100:
+        facts.append(f"{name} has opened a chest {chests:,} times")
+    cake = custom.get("minecraft:eat_cake_slice", 0)
+    if cake >= 3:
+        facts.append(f"{name} has eaten {cake:,} slices of cake")
+    trades = entry.get("trades", 0)
+    if trades >= 10:
+        facts.append(f"{name} has made {trades:,} villager trades")
+    bred = entry.get("animals_bred", 0)
+    if bred >= 10:
+        facts.append(f"{name} has bred {bred:,} animals")
+    hearts = entry.get("damage_taken", 0) / 2
+    if hearts >= 100:
+        facts.append(f"{name} has absorbed {hearts:,.0f} hearts of damage "
+                     f"and lived to tell about it")
+    slept = custom.get("minecraft:sleep_in_bed", 0)
+    if slept >= 5:
+        facts.append(f"{name} has slept through {slept:,} nights")
+    if chat_total >= 25:
+        facts.append(f"{name} has sent {chat_total:,} chat messages")
+    if streak >= 3:
+        facts.append(f"{name} has played {streak} days in a row")
+    if not facts:
+        facts = [f"{name} remains a person of complete mystery"]
+    return facts
+
+
 # ---------------------------------------------------------------- spotlight --
 
 def spotlight_embed(name, entry, day_key):

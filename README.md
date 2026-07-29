@@ -247,6 +247,11 @@ off, so nothing breaks when it isn't available:
 - **In-game event mirror** (`ingame_events`) — everything the events channel gets is
   also told to the players it happened to, via `tellraw`: records broken, streaks, the
   day's challenge, awards
+- **Fun facts** (`fun_facts_per_hour`, default 3) — every so often, at jittered
+  moments, the game chat is told something true about a random online player, drawn
+  from their own save: "Did you know? Creeper has killed owen1915 9 times. A true
+  nemesis." Whoever was featured most recently is skipped, small numbers are never
+  announced, and each fact is mirrored into the chat transcript
 - **Dynamic MOTD** (`dynamic_motd`) — see below
 
 ## The dynamic MOTD

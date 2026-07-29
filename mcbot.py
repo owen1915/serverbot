@@ -23,6 +23,7 @@ import datetime as dt
 import gzip
 import json
 import os
+import random
 import re
 import socket
 import struct
@@ -103,6 +104,9 @@ DEFAULTS = {
     # Mirror event announcements (records, streaks, awards…) into the game
     # itself, via RCON. Does nothing until RCON is enabled on the server.
     "ingame_events": True,
+    # Fun facts about a random online player, told in game chat. Roughly
+    # this many an hour, at jittered moments; 0 turns them off.
+    "fun_facts_per_hour": 3,
     # Keep the MOTD fresh through MiniMOTD's config. Also needs RCON.
     "dynamic_motd": True,
     "motd_refresh_seconds": 600,
@@ -1316,6 +1320,8 @@ class Bot:
         self.last_stat_cards = 0.0
         self.last_daily_cards = 0.0
         self.last_motd = 0.0
+        self.next_fact = time.time() + random.uniform(120, 1200)
+        self.fact_recent = []   # who was featured lately, newest last
         self.status = None
         # The datapacks' objectives are a curated goal list, used to say which
         # goals are still unmet. What gets *shown* comes from the save itself,
@@ -1771,6 +1777,35 @@ class Bot:
                                    f"{fmt(top - second)} of {leader} in {label} "
                                    f"({fmt(second)} vs {fmt(top)}).")
 
+    def maybe_fun_fact(self, now):
+        """Every so often, tell the room something true about somebody in it.
+
+        Fires at jittered moments averaging fun_facts_per_hour, and only
+        when somebody is actually online to be told about. Whoever was
+        featured most recently is skipped, so the same player is not the
+        subject twice running.
+        """
+        if not CFG["fun_facts_per_hour"] or now < self.next_fact:
+            return
+        average = 3600 / CFG["fun_facts_per_hour"]
+        self.next_fact = now + random.uniform(average * 0.6, average * 1.4)
+        online = [n for n in self.state["players"] if n in self.stats]
+        if not online or DRY_RUN:
+            return
+        fresh = [n for n in online if n not in self.fact_recent[-2:]]
+        name = random.choice(fresh or online)
+        facts = funstats.fun_facts(
+            name, self.stats[name],
+            chat_total=self.fun["chat_total"].get(name, 0),
+            streak=self.fun["streaks"].get(name, {}).get("current", 0))
+        fact = random.choice(facts)
+        if rcon.broadcast(CFG["server_dir"], f"Did you know? {fact}",
+                          color="aqua") is None:
+            return  # nobody heard it — keep it out of the transcript too
+        self.fact_recent = (self.fact_recent + [name])[-4:]
+        chat_say(f"✨  *Did you know? {fact}*")
+        log(f"[fact] {fact}")
+
     def roll_day(self, playtimes, now):
         """The 3:00 am Eastern ceremony: recap, awards, records, streaks.
 
@@ -2190,6 +2225,7 @@ class Bot:
             self.refresh_criteria()
             self.check_milestones(all_playtimes(self.stats, self.state, now))
             self.check_fun(now)
+        self.maybe_fun_fact(now)
         if (CFG["external_check"] and CFG["public_address"]
                 and now - self.last_external >= CFG["external_check_minutes"] * 60):
             self.last_external = now

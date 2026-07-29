@@ -514,6 +514,30 @@ def test_rcon_and_motd():
           "owen1915 is on a 3-day streak!")
 
 
+def test_fun_facts():
+    """Facts come from the player's own save, and small numbers stay quiet."""
+    import funstats
+    entry = {
+        "raw": {"minecraft:mined": {"minecraft:netherrack": 55_660},
+                "minecraft:killed_by": {"minecraft:creeper": 9},
+                "minecraft:custom": {"minecraft:jump": 17_353}},
+        "deaths": 16, "distance_cm": 42_195_000, "play_time": 3600 * 53,
+        "fish_caught": 1, "trades": 2, "animals_bred": 0, "damage_taken": 0,
+    }
+    facts = funstats.fun_facts("owen1915", entry, chat_total=500, streak=4)
+    joined = " | ".join(facts)
+    check("the favorite block is named", "55,660 Netherrack" in joined, True)
+    check("the nemesis is named", "Creeper has killed owen1915 9 times" in joined,
+          True)
+    check("distance converts to marathons", "10.0 marathons" in joined, True)
+    check("one fish is not worth announcing", "fish" in joined, False)
+    check("chat and streak facts appear",
+          "500 chat messages" in joined and "4 days in a row" in joined, True)
+    check("an empty save yields the mystery fact",
+          funstats.fun_facts("ghost", {"raw": {}}),
+          ["ghost remains a person of complete mystery"])
+
+
 def test_ledger():
     """The Ledger reader: counts, the time boundary, and the busiest chunk."""
     import sqlite3
@@ -644,6 +668,8 @@ def main():
     test_celebrations()
     print()
     test_rcon_and_motd()
+    print()
+    test_fun_facts()
     print()
     test_ledger()
     print()
