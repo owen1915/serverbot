@@ -1832,41 +1832,44 @@ class Bot:
     FACT_COLORS = ("aqua", "green", "yellow", "gold", "light_purple",
                    "red", "blue", "dark_aqua", "white")
 
-    # What the tab list can show: label, and where each player's number
-    # comes from. "agg" keys read the lifetime aggregate; callables read
-    # anything else. Values are lifetime, like the facts.
+    # What the tab list can show: label, where each player's number comes
+    # from, format, and the stat's signature color. "agg" keys read the
+    # lifetime aggregate; callables read anything else.
     TAB_STATS = [
-        ("blocks mined", "mined", "{:,.0f}"),
-        ("deaths", "deaths", "{:,.0f}"),
+        ("blocks mined", "mined", "{:,.0f}", "aqua"),
+        ("deaths", "deaths", "{:,.0f}", "red"),
         ("hours played",
          lambda self, agg, name: self.stats.get(name, {}).get("play_time", 0) / 3600,
-         "{:,.0f}"),
-        ("mob kills", "killed", "{:,.0f}"),
+         "{:,.0f}", "gold"),
+        ("mob kills", "killed", "{:,.0f}", "dark_red"),
         ("km travelled",
          lambda self, agg, name: agg.get(name, {}).get("distance", 0) / 100_000,
-         "{:,.1f}"),
-        ("blocks placed", "placed", "{:,.0f}"),
-        ("jumps", "jumps", "{:,.0f}"),
+         "{:,.1f}", "yellow"),
+        ("blocks placed", "placed", "{:,.0f}", "green"),
+        ("jumps", "jumps", "{:,.0f}", "light_purple"),
         ("diamond ore",
          lambda self, agg, name: sum(
              self.criterion_values.get(name, {}).get(c, 0)
              for c in Bot.DIAMOND_CRITERIA),
-         "{:,.0f}"),
-        ("fish caught", "fish", "{:,.0f}"),
-        ("villager trades", "trades", "{:,.0f}"),
+         "{:,.0f}", "dark_aqua"),
+        ("fish caught", "fish", "{:,.0f}", "blue"),
+        ("villager trades", "trades", "{:,.0f}", "dark_green"),
     ]
 
     def _tab_row_cmds(self, agg, name, index):
         """The two commands that write one player's labelled tab entry."""
-        label, source, fmt = self.TAB_STATS[index % len(self.TAB_STATS)]
+        label, source, fmt, color = self.TAB_STATS[index % len(self.TAB_STATS)]
         if callable(source):
             value = source(self, agg, name)
         else:
             value = agg.get(name, {}).get(source, 0)
-        shown = fmt.format(value)
+        component = json.dumps([
+            {"text": fmt.format(value) + " ", "color": color, "bold": True},
+            {"text": label, "color": "gray"},
+        ])
         return [f"scoreboard players set {name} mcbot_tab {int(value)}",
                 f"scoreboard players display numberformat {name} "
-                f'mcbot_tab fixed "{shown} {label}"']
+                f"mcbot_tab fixed {component}"]
 
     def rotate_tab(self, online):
         """Show the next statistic in the tab list, labelled on every row.
@@ -1887,6 +1890,17 @@ class Bot:
         cmds.append("scoreboard objectives setdisplay list mcbot_tab")
         if rcon.commands(CFG["server_dir"], cmds) is not None:
             log(f"[tab] now showing {self.TAB_STATS[index][0]}")
+
+    def refresh_tab_now(self, online):
+        """Redraw the currently-shown tab statistic without advancing it."""
+        index = self.fun.get("tab_current")
+        if index is None or not online:
+            return
+        agg = funstats.aggregate(self.criteria, self.criterion_values)
+        cmds = []
+        for name in online:
+            cmds += self._tab_row_cmds(agg, name, index)
+        rcon.commands(CFG["server_dir"], cmds)
 
     def tab_join(self, name):
         """Stamp a joining player's row with whatever the tab is showing now.
